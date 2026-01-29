@@ -1,6 +1,7 @@
 import functools
 import hashlib
 import os
+import platform
 import tempfile
 from pathlib import Path
 
@@ -115,7 +116,7 @@ class CPUBackend(BaseBackend):
     def __init__(self, target: tuple) -> None:
         super().__init__(target)
         self.binary_ext = "so"
-        self.cpu_arch = llvm.get_cpu_tripple().split("-")[0]
+        self.cpu_arch = platform.machine()
         self.cpu_name = llvm.get_cpu_name()
         self.cpu_features = llvm.get_cpu_features()
         if 'amx-tile' in self.cpu_features:
