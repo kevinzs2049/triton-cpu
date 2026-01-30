@@ -39,28 +39,6 @@ static Value extractElem2D(Location loc, Value vec, int64_t r, int64_t c,
                                                    cstI64(loc, c, rewriter));
 }
 
-static Value extractCol8(Location loc, Value tile, int64_t c,
-                         PatternRewriter &rewriter) {
-  auto i8Ty = cast<VectorType>(tile.getType()).getElementType();
-  auto colTy = VectorType::get({8, 1}, i8Ty);
-  auto vecTy = VectorType::get({8}, i8Ty);
-  Value col = rewriter.create<vector::ExtractStridedSliceOp>(
-      loc, tile, ArrayRef<int64_t>{0, c}, ArrayRef<int64_t>{8, 1},
-      ArrayRef<int64_t>{1, 1});
-  return rewriter.create<vector::ShapeCastOp>(loc, vecTy, col);
-}
-
-static Value extractCol16(Location loc, Value tile, int64_t c,
-                          PatternRewriter &rewriter) {
-  auto i8Ty = cast<VectorType>(tile.getType()).getElementType();
-  auto colTy = VectorType::get({16, 1}, i8Ty);
-  auto vecTy = VectorType::get({16}, i8Ty);
-  Value col = rewriter.create<vector::ExtractStridedSliceOp>(
-      loc, tile, ArrayRef<int64_t>{0, c}, ArrayRef<int64_t>{16, 1},
-      ArrayRef<int64_t>{1, 1});
-  return rewriter.create<vector::ShapeCastOp>(loc, vecTy, col);
-}
-
 static Value packVec8ToNxv16(Location loc, Value vec8, Type nxv16i8Ty,
                              PatternRewriter &rewriter) {
   Value acc = rewriter.create<LLVM::UndefOp>(loc, nxv16i8Ty);
@@ -122,16 +100,6 @@ static Value pack2x8i8ToNxv16(Location loc, Value tile, Type nxv16i8Ty,
   Value row1 = rewriter.create<vector::ExtractOp>(loc, tile, 1);
   Value v0 = packVec8ToNxv16(loc, row0, nxv16i8Ty, rewriter);
   Value v1 = packVec8ToNxv16(loc, row1, nxv16i8Ty, rewriter);
-  return zip1I64(loc, v0, v1, nxv16i8Ty, rewriter);
-}
-
-static Value pack8x2i8ToNxv16(Location loc, Value tile, Type nxv16i8Ty,
-                              PatternRewriter &rewriter) {
-  // Pack columns as [col0(8), col1(8)] which matches zip1 on 64-bit lanes.
-  Value col0 = extractCol8(loc, tile, 0, rewriter);
-  Value col1 = extractCol8(loc, tile, 1, rewriter);
-  Value v0 = packVec8ToNxv16(loc, col0, nxv16i8Ty, rewriter);
-  Value v1 = packVec8ToNxv16(loc, col1, nxv16i8Ty, rewriter);
   return zip1I64(loc, v0, v1, nxv16i8Ty, rewriter);
 }
 
@@ -276,41 +244,77 @@ LogicalResult convertCandidate(SVE2I8MMDotOpCandidate &candidate,
       StringAttr::get(op.getContext(), "llvm.aarch64.sve.smmla.nxv4i32");
 
   Value res = op.getC();
-  for (int64_t m = 0; m < M; m += 4) {
-    for (int64_t n = 0; n < N; n += 4) {
-      // Four 2x2 sub-tiles inside each 4x4 block.
-      Value accTile00 = rewriter.create<vector::ExtractStridedSliceOp>(
-          loc, res, ArrayRef<int64_t>{m + 0, n + 0}, ArrayRef<int64_t>{2, 2},
-          ArrayRef<int64_t>{1, 1});
-      Value accTile01 = rewriter.create<vector::ExtractStridedSliceOp>(
-          loc, res, ArrayRef<int64_t>{m + 0, n + 2}, ArrayRef<int64_t>{2, 2},
-          ArrayRef<int64_t>{1, 1});
-      Value accTile10 = rewriter.create<vector::ExtractStridedSliceOp>(
-          loc, res, ArrayRef<int64_t>{m + 2, n + 0}, ArrayRef<int64_t>{2, 2},
-          ArrayRef<int64_t>{1, 1});
-      Value accTile11 = rewriter.create<vector::ExtractStridedSliceOp>(
-          loc, res, ArrayRef<int64_t>{m + 2, n + 2}, ArrayRef<int64_t>{2, 2},
-          ArrayRef<int64_t>{1, 1});
+  for (int64_t n = 0; n < N; n += 4) {
+    if (K % 16 == 0) {
+      SmallVector<Value, 4> bLo0s;
+      SmallVector<Value, 4> bHi0s;
+      SmallVector<Value, 4> bLo1s;
+      SmallVector<Value, 4> bHi1s;
+      bLo0s.reserve(K / 16);
+      bHi0s.reserve(K / 16);
+      bLo1s.reserve(K / 16);
+      bHi1s.reserve(K / 16);
 
-      Value accVec00 = pack2x2i32ToNxv4(loc, accTile00, nxv4i32Ty, rewriter);
-      Value accVec01 = pack2x2i32ToNxv4(loc, accTile01, nxv4i32Ty, rewriter);
-      Value accVec10 = pack2x2i32ToNxv4(loc, accTile10, nxv4i32Ty, rewriter);
-      Value accVec11 = pack2x2i32ToNxv4(loc, accTile11, nxv4i32Ty, rewriter);
+      for (int64_t k = 0; k < K; k += 16) {
+        Value bTile0 = rewriter.create<vector::ExtractStridedSliceOp>(
+            loc, op.getB(), ArrayRef<int64_t>{k, n + 0},
+            ArrayRef<int64_t>{16, 2}, ArrayRef<int64_t>{1, 1});
+        Value bTile1 = rewriter.create<vector::ExtractStridedSliceOp>(
+            loc, op.getB(), ArrayRef<int64_t>{k, n + 2},
+            ArrayRef<int64_t>{16, 2}, ArrayRef<int64_t>{1, 1});
 
-      if (K % 16 == 0) {
-        for (int64_t k = 0; k < K; k += 16) {
+        Value bTile0T = rewriter.create<vector::TransposeOp>(
+            loc, bTile0, ArrayRef<int64_t>{1, 0});
+        Value bTile1T = rewriter.create<vector::TransposeOp>(
+            loc, bTile1, ArrayRef<int64_t>{1, 0});
+
+        Value bRow00 = rewriter.create<vector::ExtractOp>(loc, bTile0T, 0);
+        Value bRow01 = rewriter.create<vector::ExtractOp>(loc, bTile0T, 1);
+        Value bRow10 = rewriter.create<vector::ExtractOp>(loc, bTile1T, 0);
+        Value bRow11 = rewriter.create<vector::ExtractOp>(loc, bTile1T, 1);
+        Value bVec00 = packVec16ToNxv16(loc, bRow00, nxv16i8Ty, rewriter);
+        Value bVec01 = packVec16ToNxv16(loc, bRow01, nxv16i8Ty, rewriter);
+        Value bVec10 = packVec16ToNxv16(loc, bRow10, nxv16i8Ty, rewriter);
+        Value bVec11 = packVec16ToNxv16(loc, bRow11, nxv16i8Ty, rewriter);
+        Value bLo0 = zip1I64(loc, bVec00, bVec01, nxv16i8Ty, rewriter);
+        Value bHi0 = zip2I64(loc, bVec00, bVec01, nxv16i8Ty, rewriter);
+        Value bLo1 = zip1I64(loc, bVec10, bVec11, nxv16i8Ty, rewriter);
+        Value bHi1 = zip2I64(loc, bVec10, bVec11, nxv16i8Ty, rewriter);
+
+        bLo0s.push_back(bLo0);
+        bHi0s.push_back(bHi0);
+        bLo1s.push_back(bLo1);
+        bHi1s.push_back(bHi1);
+      }
+
+      for (int64_t m = 0; m < M; m += 4) {
+        // Four 2x2 sub-tiles inside each 4x4 block.
+        Value accTile00 = rewriter.create<vector::ExtractStridedSliceOp>(
+            loc, res, ArrayRef<int64_t>{m + 0, n + 0}, ArrayRef<int64_t>{2, 2},
+            ArrayRef<int64_t>{1, 1});
+        Value accTile01 = rewriter.create<vector::ExtractStridedSliceOp>(
+            loc, res, ArrayRef<int64_t>{m + 0, n + 2}, ArrayRef<int64_t>{2, 2},
+            ArrayRef<int64_t>{1, 1});
+        Value accTile10 = rewriter.create<vector::ExtractStridedSliceOp>(
+            loc, res, ArrayRef<int64_t>{m + 2, n + 0}, ArrayRef<int64_t>{2, 2},
+            ArrayRef<int64_t>{1, 1});
+        Value accTile11 = rewriter.create<vector::ExtractStridedSliceOp>(
+            loc, res, ArrayRef<int64_t>{m + 2, n + 2}, ArrayRef<int64_t>{2, 2},
+            ArrayRef<int64_t>{1, 1});
+
+        Value accVec00 = pack2x2i32ToNxv4(loc, accTile00, nxv4i32Ty, rewriter);
+        Value accVec01 = pack2x2i32ToNxv4(loc, accTile01, nxv4i32Ty, rewriter);
+        Value accVec10 = pack2x2i32ToNxv4(loc, accTile10, nxv4i32Ty, rewriter);
+        Value accVec11 = pack2x2i32ToNxv4(loc, accTile11, nxv4i32Ty, rewriter);
+
+        int64_t ki = 0;
+        for (int64_t k = 0; k < K; k += 16, ++ki) {
           Value aTile0 = rewriter.create<vector::ExtractStridedSliceOp>(
               loc, op.getA(), ArrayRef<int64_t>{m + 0, k},
               ArrayRef<int64_t>{2, 16}, ArrayRef<int64_t>{1, 1});
           Value aTile1 = rewriter.create<vector::ExtractStridedSliceOp>(
               loc, op.getA(), ArrayRef<int64_t>{m + 2, k},
               ArrayRef<int64_t>{2, 16}, ArrayRef<int64_t>{1, 1});
-          Value bTile0 = rewriter.create<vector::ExtractStridedSliceOp>(
-              loc, op.getB(), ArrayRef<int64_t>{k, n + 0},
-              ArrayRef<int64_t>{16, 2}, ArrayRef<int64_t>{1, 1});
-          Value bTile1 = rewriter.create<vector::ExtractStridedSliceOp>(
-              loc, op.getB(), ArrayRef<int64_t>{k, n + 2},
-              ArrayRef<int64_t>{16, 2}, ArrayRef<int64_t>{1, 1});
 
           Value aRow00 = rewriter.create<vector::ExtractOp>(loc, aTile0, 0);
           Value aRow01 = rewriter.create<vector::ExtractOp>(loc, aTile0, 1);
@@ -325,18 +329,10 @@ LogicalResult convertCandidate(SVE2I8MMDotOpCandidate &candidate,
           Value aLo1 = zip1I64(loc, aVec10, aVec11, nxv16i8Ty, rewriter);
           Value aHi1 = zip2I64(loc, aVec10, aVec11, nxv16i8Ty, rewriter);
 
-          Value bCol00 = extractCol16(loc, bTile0, 0, rewriter);
-          Value bCol01 = extractCol16(loc, bTile0, 1, rewriter);
-          Value bCol10 = extractCol16(loc, bTile1, 0, rewriter);
-          Value bCol11 = extractCol16(loc, bTile1, 1, rewriter);
-          Value bVec00 = packVec16ToNxv16(loc, bCol00, nxv16i8Ty, rewriter);
-          Value bVec01 = packVec16ToNxv16(loc, bCol01, nxv16i8Ty, rewriter);
-          Value bVec10 = packVec16ToNxv16(loc, bCol10, nxv16i8Ty, rewriter);
-          Value bVec11 = packVec16ToNxv16(loc, bCol11, nxv16i8Ty, rewriter);
-          Value bLo0 = zip1I64(loc, bVec00, bVec01, nxv16i8Ty, rewriter);
-          Value bHi0 = zip2I64(loc, bVec00, bVec01, nxv16i8Ty, rewriter);
-          Value bLo1 = zip1I64(loc, bVec10, bVec11, nxv16i8Ty, rewriter);
-          Value bHi1 = zip2I64(loc, bVec10, bVec11, nxv16i8Ty, rewriter);
+          Value bLo0 = bLo0s[ki];
+          Value bHi0 = bHi0s[ki];
+          Value bLo1 = bLo1s[ki];
+          Value bHi1 = bHi1s[ki];
 
           accVec00 = rewriter
                          .create<LLVM::CallIntrinsicOp>(
@@ -382,25 +378,71 @@ LogicalResult convertCandidate(SVE2I8MMDotOpCandidate &candidate,
                              ValueRange{accVec11, aHi1, bHi1})
                          .getResult(0);
         }
-      } else {
-        for (int64_t k = 0; k < K; k += 8) {
+
+        auto tile4x4Ty = VectorType::get({4, 4}, i32Ty);
+        Value tile4x4 = build4x4FromAccVecs(loc, accVec00, accVec01, accVec10,
+                                            accVec11, tile4x4Ty, rewriter);
+        res = rewriter.create<vector::InsertStridedSliceOp>(
+            loc, tile4x4, res, ArrayRef<int64_t>{m, n}, ArrayRef<int64_t>{1, 1});
+      }
+    } else {
+      SmallVector<Value, 4> bVec0s;
+      SmallVector<Value, 4> bVec1s;
+      bVec0s.reserve(K / 8);
+      bVec1s.reserve(K / 8);
+
+      for (int64_t k = 0; k < K; k += 8) {
+        Value bTile0 = rewriter.create<vector::ExtractStridedSliceOp>(
+            loc, op.getB(), ArrayRef<int64_t>{k, n + 0},
+            ArrayRef<int64_t>{8, 2}, ArrayRef<int64_t>{1, 1});
+        Value bTile1 = rewriter.create<vector::ExtractStridedSliceOp>(
+            loc, op.getB(), ArrayRef<int64_t>{k, n + 2},
+            ArrayRef<int64_t>{8, 2}, ArrayRef<int64_t>{1, 1});
+
+        Value bTile0T = rewriter.create<vector::TransposeOp>(
+            loc, bTile0, ArrayRef<int64_t>{1, 0});
+        Value bTile1T = rewriter.create<vector::TransposeOp>(
+            loc, bTile1, ArrayRef<int64_t>{1, 0});
+
+        Value bVec0 = pack2x8i8ToNxv16(loc, bTile0T, nxv16i8Ty, rewriter);
+        Value bVec1 = pack2x8i8ToNxv16(loc, bTile1T, nxv16i8Ty, rewriter);
+        bVec0s.push_back(bVec0);
+        bVec1s.push_back(bVec1);
+      }
+
+      for (int64_t m = 0; m < M; m += 4) {
+        // Four 2x2 sub-tiles inside each 4x4 block.
+        Value accTile00 = rewriter.create<vector::ExtractStridedSliceOp>(
+            loc, res, ArrayRef<int64_t>{m + 0, n + 0}, ArrayRef<int64_t>{2, 2},
+            ArrayRef<int64_t>{1, 1});
+        Value accTile01 = rewriter.create<vector::ExtractStridedSliceOp>(
+            loc, res, ArrayRef<int64_t>{m + 0, n + 2}, ArrayRef<int64_t>{2, 2},
+            ArrayRef<int64_t>{1, 1});
+        Value accTile10 = rewriter.create<vector::ExtractStridedSliceOp>(
+            loc, res, ArrayRef<int64_t>{m + 2, n + 0}, ArrayRef<int64_t>{2, 2},
+            ArrayRef<int64_t>{1, 1});
+        Value accTile11 = rewriter.create<vector::ExtractStridedSliceOp>(
+            loc, res, ArrayRef<int64_t>{m + 2, n + 2}, ArrayRef<int64_t>{2, 2},
+            ArrayRef<int64_t>{1, 1});
+
+        Value accVec00 = pack2x2i32ToNxv4(loc, accTile00, nxv4i32Ty, rewriter);
+        Value accVec01 = pack2x2i32ToNxv4(loc, accTile01, nxv4i32Ty, rewriter);
+        Value accVec10 = pack2x2i32ToNxv4(loc, accTile10, nxv4i32Ty, rewriter);
+        Value accVec11 = pack2x2i32ToNxv4(loc, accTile11, nxv4i32Ty, rewriter);
+
+        int64_t ki = 0;
+        for (int64_t k = 0; k < K; k += 8, ++ki) {
           Value aTile0 = rewriter.create<vector::ExtractStridedSliceOp>(
               loc, op.getA(), ArrayRef<int64_t>{m + 0, k},
               ArrayRef<int64_t>{2, 8}, ArrayRef<int64_t>{1, 1});
           Value aTile1 = rewriter.create<vector::ExtractStridedSliceOp>(
               loc, op.getA(), ArrayRef<int64_t>{m + 2, k},
               ArrayRef<int64_t>{2, 8}, ArrayRef<int64_t>{1, 1});
-          Value bTile0 = rewriter.create<vector::ExtractStridedSliceOp>(
-              loc, op.getB(), ArrayRef<int64_t>{k, n + 0},
-              ArrayRef<int64_t>{8, 2}, ArrayRef<int64_t>{1, 1});
-          Value bTile1 = rewriter.create<vector::ExtractStridedSliceOp>(
-              loc, op.getB(), ArrayRef<int64_t>{k, n + 2},
-              ArrayRef<int64_t>{8, 2}, ArrayRef<int64_t>{1, 1});
 
           Value aVec0 = pack2x8i8ToNxv16(loc, aTile0, nxv16i8Ty, rewriter);
           Value aVec1 = pack2x8i8ToNxv16(loc, aTile1, nxv16i8Ty, rewriter);
-          Value bVec0 = pack8x2i8ToNxv16(loc, bTile0, nxv16i8Ty, rewriter);
-          Value bVec1 = pack8x2i8ToNxv16(loc, bTile1, nxv16i8Ty, rewriter);
+          Value bVec0 = bVec0s[ki];
+          Value bVec1 = bVec1s[ki];
 
           accVec00 = rewriter
                          .create<LLVM::CallIntrinsicOp>(
@@ -423,13 +465,13 @@ LogicalResult convertCandidate(SVE2I8MMDotOpCandidate &candidate,
                              ValueRange{accVec11, aVec1, bVec1})
                          .getResult(0);
         }
-      }
 
-      auto tile4x4Ty = VectorType::get({4, 4}, i32Ty);
-      Value tile4x4 = build4x4FromAccVecs(loc, accVec00, accVec01, accVec10,
-                                          accVec11, tile4x4Ty, rewriter);
-      res = rewriter.create<vector::InsertStridedSliceOp>(
-          loc, tile4x4, res, ArrayRef<int64_t>{m, n}, ArrayRef<int64_t>{1, 1});
+        auto tile4x4Ty = VectorType::get({4, 4}, i32Ty);
+        Value tile4x4 = build4x4FromAccVecs(loc, accVec00, accVec01, accVec10,
+                                            accVec11, tile4x4Ty, rewriter);
+        res = rewriter.create<vector::InsertStridedSliceOp>(
+            loc, tile4x4, res, ArrayRef<int64_t>{m, n}, ArrayRef<int64_t>{1, 1});
+      }
     }
   }
 
