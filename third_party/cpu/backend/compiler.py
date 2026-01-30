@@ -208,8 +208,12 @@ class CPUBackend(BaseBackend):
         if convert_bf16_dot_product:
             use_horizontal_sum = os.getenv("TRITON_CPU_DOT_PROD_HORIZ_SUM", "1") == "1"
             cpu.passes.ttcpuir.add_convert_dot_product(pm, use_horizontal_sum)
-        convert_sve2_i8mm = ((self.cpu_arch == "aarch64" or self.cpu_arch == "armv8")
-                             and ("sve2" in self.cpu_features))
+        disable_sve2_i8mm = os.getenv("TRITON_CPU_DISABLE_SVE2_I8MM", "0").upper() in (
+            "1", "ON", "YES", "TRUE", "Y",
+        )
+        convert_sve2_i8mm = (not disable_sve2_i8mm and
+                             (self.cpu_arch == "aarch64" or self.cpu_arch == "armv8") and
+                             ("sve2" in self.cpu_features))
         if convert_sve2_i8mm:
             cpu.passes.ttcpuir.add_convert_dot_to_sve2_i8mm(pm)
         if 'amx-tile' in self.cpu_features:
