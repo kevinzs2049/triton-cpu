@@ -41,26 +41,41 @@ static Value extractElem2D(Location loc, Value vec, int64_t r, int64_t c,
 
 static Value packVec8ToNxv16(Location loc, Value vec8, Type nxv16i8Ty,
                              PatternRewriter &rewriter) {
-  Value acc = rewriter.create<LLVM::UndefOp>(loc, nxv16i8Ty);
-  for (int64_t idx = 0; idx < 8; ++idx) {
-    Value elem = rewriter.create<vector::ExtractElementOp>(
-        loc, vec8, cstI64(loc, idx, rewriter));
-    acc = rewriter.create<LLVM::InsertElementOp>(
-        loc, nxv16i8Ty, acc, elem, cstI64(loc, idx, rewriter));
-  }
-  return acc;
+  auto i64Ty = rewriter.getI64Type();
+  auto v1i64Ty = VectorType::get({1}, i64Ty);
+  auto nxv2i64Ty = LLVM::LLVMScalableVectorType::get(i64Ty, 2);
+
+  Value v1i64 = rewriter.create<vector::BitCastOp>(loc, v1i64Ty, vec8);
+  Value lo = rewriter.create<vector::ExtractElementOp>(
+      loc, v1i64, cstI64(loc, 0, rewriter));
+
+  Value acc64 = rewriter.create<LLVM::UndefOp>(loc, nxv2i64Ty);
+  acc64 = rewriter.create<LLVM::InsertElementOp>(
+      loc, nxv2i64Ty, acc64, lo, cstI64(loc, 0, rewriter));
+  acc64 = rewriter.create<LLVM::InsertElementOp>(
+      loc, nxv2i64Ty, acc64, cstI64(loc, 0, rewriter),
+      cstI64(loc, 1, rewriter));
+  return rewriter.create<LLVM::BitcastOp>(loc, nxv16i8Ty, acc64);
 }
 
 static Value packVec16ToNxv16(Location loc, Value vec16, Type nxv16i8Ty,
                               PatternRewriter &rewriter) {
-  Value acc = rewriter.create<LLVM::UndefOp>(loc, nxv16i8Ty);
-  for (int64_t idx = 0; idx < 16; ++idx) {
-    Value elem = rewriter.create<vector::ExtractElementOp>(
-        loc, vec16, cstI64(loc, idx, rewriter));
-    acc = rewriter.create<LLVM::InsertElementOp>(
-        loc, nxv16i8Ty, acc, elem, cstI64(loc, idx, rewriter));
-  }
-  return acc;
+  auto i64Ty = rewriter.getI64Type();
+  auto v2i64Ty = VectorType::get({2}, i64Ty);
+  auto nxv2i64Ty = LLVM::LLVMScalableVectorType::get(i64Ty, 2);
+
+  Value v2i64 = rewriter.create<vector::BitCastOp>(loc, v2i64Ty, vec16);
+  Value lo = rewriter.create<vector::ExtractElementOp>(
+      loc, v2i64, cstI64(loc, 0, rewriter));
+  Value hi = rewriter.create<vector::ExtractElementOp>(
+      loc, v2i64, cstI64(loc, 1, rewriter));
+
+  Value acc64 = rewriter.create<LLVM::UndefOp>(loc, nxv2i64Ty);
+  acc64 = rewriter.create<LLVM::InsertElementOp>(
+      loc, nxv2i64Ty, acc64, lo, cstI64(loc, 0, rewriter));
+  acc64 = rewriter.create<LLVM::InsertElementOp>(
+      loc, nxv2i64Ty, acc64, hi, cstI64(loc, 1, rewriter));
+  return rewriter.create<LLVM::BitcastOp>(loc, nxv16i8Ty, acc64);
 }
 
 static Value zip1I64(Location loc, Value a, Value b, Type nxv16i8Ty,
