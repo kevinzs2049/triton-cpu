@@ -16,9 +16,9 @@ import triton.backends.cpu.driver as cpu_driver
 
 
 def min_dot_size(target: GPUTarget):
-    # Allow M=2 for GEMV-like decode workloads (SVE2 i8mm M=2 path)
+    # Allow M=1 for true GEMV decode workloads (M=1 token generation)
     # N and K still require >=4 for tl.dot tiling constraints
-    return lambda lhsType, rhsType: (2, 4, 4)
+    return lambda lhsType, rhsType: (1, 4, 4)
 
 
 VecLib = cpu.passes.ttcpuir.VecLib
