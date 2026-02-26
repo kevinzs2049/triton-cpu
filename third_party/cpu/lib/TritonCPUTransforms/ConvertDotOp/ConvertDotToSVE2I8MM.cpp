@@ -472,21 +472,34 @@ LogicalResult convertCandidate(SVE2I8MMDotOpCandidate &candidate,
     Value mLim = rewriter.create<arith::ConstantIndexOp>(loc, M);
     Value mStp = rewriter.create<arith::ConstantIndexOp>(loc, M_REG * 4);
 
+    // Hoist AllocaOps to before the enclosing scf::ForOp (K-loop) so that
+    // LLVM sees them in the function entry block and doesn't re-allocate
+    // stack space on every K-loop iteration (which causes stack overflow for
+    // large K / small BK, e.g. K=18944, BK=32 → 592 iterations × 18KB).
+    auto savedIP = rewriter.saveInsertionPoint();
+    if (auto parentForOp = op->getParentOfType<scf::ForOp>()) {
+      rewriter.setInsertionPoint(parentForOp);
+    }
+
     // Store A into a stack buffer so we can load rows with DYNAMIC indices.
     // vector::LoadOp with dynamic address prevents LLVM CSE/LICM of A rows.
     Value aAlloca = rewriter.create<memref::AllocaOp>(
         loc, aMemRefTy,
         rewriter.getIntegerAttr(rewriter.getI64Type(), 64));
+
+    Value resAlloca = rewriter.create<memref::AllocaOp>(
+        loc, resMemRefTy,
+        rewriter.getIntegerAttr(rewriter.getI64Type(), 64));
+
+    // Restore insertion point to continue at DotOp's original location.
+    rewriter.restoreInsertionPoint(savedIP);
+
     for (int64_t row = 0; row < M; ++row) {
       Value aRowVec = rewriter.create<vector::ExtractOp>(loc, A, row);
       Value rowIdx = rewriter.create<arith::ConstantIndexOp>(loc, row);
       rewriter.create<vector::StoreOp>(loc, aRowVec, aAlloca,
                                        ValueRange{rowIdx, c0});
     }
-
-    Value resAlloca = rewriter.create<memref::AllocaOp>(
-        loc, resMemRefTy,
-        rewriter.getIntegerAttr(rewriter.getI64Type(), 64));
 
     // Init res alloca from accumulator (all M rows, static indices)
     for (int64_t row = 0; row < M; ++row) {
