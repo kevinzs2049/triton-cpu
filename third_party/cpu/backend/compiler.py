@@ -120,6 +120,24 @@ class CPUBackend(BaseBackend):
         self.cpu_arch = platform.machine()
         self.cpu_name = llvm.get_cpu_name()
         self.cpu_features = llvm.get_cpu_features()
+        # LLVM get_cpu_features() on aarch64 misses several features (e.g. i8mm, bf16).
+        # Supplement from /proc/cpuinfo 'Features' line on Linux.
+        if platform.system() == "Linux" and self.cpu_arch == "aarch64":
+            try:
+                with open("/proc/cpuinfo") as f:
+                    for line in f:
+                        if line.startswith("Features"):
+                            proc_feats = set(line.split(":")[1].split())
+                            _feat_map = {
+                                "i8mm": "i8mm", "svei8mm": "i8mm",
+                                "bf16": "bf16", "svebf16": "bf16", "asimdbf16": "bf16",
+                            }
+                            for pf, lf in _feat_map.items():
+                                if pf in proc_feats:
+                                    self.cpu_features.add(lf)
+                            break
+            except OSError:
+                pass
         if 'amx-tile' in self.cpu_features:
             if not cpu.enable_amx():
                 import warnings
