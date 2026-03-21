@@ -1,6 +1,7 @@
 import binascii
 import hashlib
 import importlib.util
+import platform
 import sys
 from argparse import ArgumentParser
 from pathlib import Path
@@ -8,14 +9,15 @@ from typing import List
 
 import triton
 import triton.backends
-from triton.backends.nvidia.driver import ty_to_cpp
 
 desc = """
 Triton ahead-of-time compiler:
 
 This program compiles the kernel with name `kernel-name` in the file at the
-provided `path` into self-contained C source-code that embeds the `cubin`
-data along with utilities to load, unload and launch the kernel.
+provided `path` into self-contained C source-code that embeds the kernel
+binary along with utilities to load, unload and launch the kernel.
+
+Supports both CUDA (cubin) and CPU (.so) backends.
 
 signature is provided as a list of (optionally divisibility-hinted) types
 or constexpr values, e.g.
@@ -26,15 +28,35 @@ will compile triton.JITFunction of name `kernel` inside the file `/path/to/kerne
 Said kernel will be specialized such that argument 0, 1 are assumed to be multiple of 16,
 and argument 2 is assumed to be a compile-time constant of value 1024, i.e. it won't be part of the generated prototype.
 
-The resulting entry point will have signature
+For CUDA backend, the resulting entry point will have signature:
+CUresult kernel_{specialization_suffix}(CUstream stream, float* arg0, int32_t arg1, int32_t arg2)
 
-CUresult kernel_{specialization_suffix}(CUstream stream, unsigned gX, unsigned gY, unsigned gZ, float* arg0, int32_t arg1, int32_t arg2)
+For CPU backend, the resulting entry point will have signature:
+int kernel_{specialization_suffix}(float* arg0, int32_t arg1, int32_t arg2)
 
-Different such specialized entry points can be combined using the `linker.py` script.
+Different such specialized entry points can be combined using the `link.py` script.
 
 NOTE: when resolving the scope of /path/to/kernel.py, the file will be executed from within its parent directory with the python interpreter
 used to run this `compile.py` script
 """
+
+
+def _detect_backend():
+    """Detect whether to use CPU or CUDA backend based on available backends."""
+    cpu_arch = platform.machine()
+    if cpu_arch in ("aarch64", "x86_64"):
+        try:
+            from triton.backends.cpu.driver import ty_to_cpp as cpu_ty_to_cpp
+            return "cpu", cpu_ty_to_cpp
+        except ImportError:
+            pass
+    try:
+        from triton.backends.nvidia.driver import ty_to_cpp as cuda_ty_to_cpp
+        return "cuda", cuda_ty_to_cpp
+    except ImportError:
+        pass
+    raise RuntimeError("No supported backend found (tried cpu, nvidia)")
+
 
 if __name__ == "__main__":
 
@@ -51,7 +73,19 @@ if __name__ == "__main__":
     parser.add_argument("--out-path", "-o", type=Path, default=None, help="Out filename")
     parser.add_argument("--signature", "-s", type=str, help="Signature of the kernel", required=True)
     parser.add_argument("--grid", "-g", type=str, help="Launch grid of the kernel", required=True)
+    parser.add_argument("--target", "-t", type=str, default=None,
+                        help="Target backend: 'cpu' or 'cuda'. Auto-detected if not specified.")
     args = parser.parse_args()
+
+    # Detect or use specified backend
+    if args.target:
+        backend = args.target
+        if backend == "cpu":
+            from triton.backends.cpu.driver import ty_to_cpp
+        else:
+            from triton.backends.nvidia.driver import ty_to_cpp
+    else:
+        backend, ty_to_cpp = _detect_backend()
 
     out_name = args.out_name if args.out_name else args.kernel_name
     out_path = args.out_path if args.out_path else Path(out_name)
@@ -103,7 +137,7 @@ if __name__ == "__main__":
     const_sig = 'x'.join([str(v) for v in constants.values()])
     doc_string = [f"{k}={v}" for k, v in constants.items()]
     doc_string += [f"num_warps={args.num_warps}", f"num_stages={args.num_stages}"]
-    # compile ast into cubin
+    # compile ast into binary
     for h in hints.values():
         assert h in [1, 16], f"Only 1 and 16 are valid hints, got {h}"
     attrs = {k: [["tt.divisibility", 16]] for k, v in hints.items() if v == 16}
@@ -136,27 +170,62 @@ if __name__ == "__main__":
         if hints.get((i, ), None) == 16:
             suffix += 'd'
     func_name = '_'.join([out_name, sig_hash, suffix])
-    asm = ccinfo.asm["cubin"]  # store binary data once
-    hex_ = str(binascii.hexlify(asm))[2:-1]
-    params = {
-        "kernel_name": func_name,
-        "triton_kernel_name": args.kernel_name,
-        "bin_size": len(asm),
-        "bin_data": ", ".join([f"0x{x}{y}" for x, y in zip(hex_[::2], hex_[1::2])]),
-        "signature": ", ".join([f"{ty_to_cpp(ty)} {name}" for name, ty in zip(arg_names_not_1, arg_types_not_1)]),
-        "full_signature": ", ".join([f"{ty_to_cpp(ty)} {name}" for name, ty in zip(arg_names, arg_types)]),
-        "arg_pointers": ", ".join([f"&{arg}" for arg in arg_names_not_1] + ["&global_scratch"]),
-        "num_args": len(arg_names_not_1) + 1,
-        "kernel_docstring": doc_string,
-        "shared": ccinfo.metadata.shared,
-        "num_warps": args.num_warps,
-        "algo_info": '_'.join([const_sig, meta_sig]),
-        "gridX": grid[0],
-        "gridY": grid[1],
-        "gridZ": grid[2],
-        "_placeholder": "",
-    }
+
+    if backend == "cpu":
+        # CPU backend: extract .so binary
+        asm = ccinfo.asm["so"]
+        hex_ = str(binascii.hexlify(asm))[2:-1]
+
+        # Build kernel function arg types for the C typedef
+        # CPU kernels take: args... + gridX, gridY, gridZ, numGridsX, numGridsY, numGridsZ (6 uint32_t)
+        kernel_fn_arg_types_list = [f"{ty_to_cpp(ty)}" for ty in arg_types_not_1] + ["uint32_t"] * 6
+        kernel_fn_args_list = ", ".join(arg_names_not_1)
+        kernel_fn_args_comma = ", " if len(arg_names_not_1) > 0 else ""
+
+        params = {
+            "kernel_name": func_name,
+            "triton_kernel_name": args.kernel_name,
+            "bin_size": len(asm),
+            "bin_data": ", ".join([f"0x{x}{y}" for x, y in zip(hex_[::2], hex_[1::2])]),
+            "signature": ", ".join([f"{ty_to_cpp(ty)} {name}" for name, ty in zip(arg_names_not_1, arg_types_not_1)]),
+            "full_signature": ", ".join([f"{ty_to_cpp(ty)} {name}" for name, ty in zip(arg_names, arg_types)]),
+            "kernel_fn_arg_types": ", ".join(kernel_fn_arg_types_list),
+            "kernel_fn_args_list": kernel_fn_args_list,
+            "kernel_fn_args_comma": kernel_fn_args_comma,
+            "kernel_docstring": doc_string,
+            "algo_info": '_'.join([const_sig, meta_sig]),
+            "gridX": grid[0],
+            "gridY": grid[1],
+            "gridZ": grid[2],
+            "_placeholder": "",
+        }
+        template_dir = "cpu"
+    else:
+        # CUDA backend: extract cubin
+        asm = ccinfo.asm["cubin"]
+        hex_ = str(binascii.hexlify(asm))[2:-1]
+
+        params = {
+            "kernel_name": func_name,
+            "triton_kernel_name": args.kernel_name,
+            "bin_size": len(asm),
+            "bin_data": ", ".join([f"0x{x}{y}" for x, y in zip(hex_[::2], hex_[1::2])]),
+            "signature": ", ".join([f"{ty_to_cpp(ty)} {name}" for name, ty in zip(arg_names_not_1, arg_types_not_1)]),
+            "full_signature": ", ".join([f"{ty_to_cpp(ty)} {name}" for name, ty in zip(arg_names, arg_types)]),
+            "arg_pointers": ", ".join([f"&{arg}" for arg in arg_names_not_1] + ["&global_scratch"]),
+            "num_args": len(arg_names_not_1) + 1,
+            "kernel_docstring": doc_string,
+            "shared": ccinfo.metadata.shared,
+            "num_warps": args.num_warps,
+            "algo_info": '_'.join([const_sig, meta_sig]),
+            "gridX": grid[0],
+            "gridY": grid[1],
+            "gridZ": grid[2],
+            "_placeholder": "",
+        }
+        template_dir = "cuda"
+
     for ext in ['h', 'c']:
-        template_path = Path(__file__).parent / "extra" / "cuda" / f"compile.{ext}"
+        template_path = Path(__file__).parent / "extra" / template_dir / f"compile.{ext}"
         with out_path.with_suffix(f".{sig_hash}_{suffix}.{ext}").open("w") as fp:
             fp.write(Path(template_path).read_text().format(**params))
