@@ -27,6 +27,7 @@
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Types.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
+#include "triton/Dialect/TritonCPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Tools/Sys/GetEnv.hpp"
 #include "llvm/Support/FileSystem.h"
@@ -1580,6 +1581,28 @@ void init_triton_ir(py::module &&m) {
              if (axis < 0 || axis > 3)
                throw pybind11::index_error("program_id must be in [0,3]");
              return self.create<GetNumProgramsOp>(axis);
+           })
+      .def("create_cpu_sdot_gemv",
+           [](TritonOpBuilder &self, mlir::Value &a_ptr, mlir::Value &b_ptr,
+              mlir::Value &c_ptr, mlir::Value &K, mlir::Value &N) {
+             self.create<CpuSdotGemvOp>(a_ptr, b_ptr, c_ptr, K, N);
+           })
+      .def("create_cpu_sdot_gemv_fused_bf16",
+           [](TritonOpBuilder &self, mlir::Value &x_ptr, mlir::Value &b_ptr,
+              mlir::Value &ws_ptr, mlir::Value &out_ptr,
+              mlir::Value &K, mlir::Value &N) {
+             self.create<CpuSdotGemvFusedBf16Op>(x_ptr, b_ptr, ws_ptr,
+                                                   out_ptr, K, N);
+           })
+      .def("create_cpu_sdot_pack_weights",
+           [](TritonOpBuilder &self, mlir::Value &b_ptr,
+              mlir::Value &bp_ptr, mlir::Value &K, mlir::Value &N) {
+             self.create<CpuSdotPackWeightsOp>(b_ptr, bp_ptr, K, N);
+           })
+      .def("create_cpu_neon_sdot",
+           [](TritonOpBuilder &self, mlir::Value &acc, mlir::Value &a,
+              mlir::Value &b) -> mlir::Value {
+             return self.create<CpuNeonSdotOp>(acc.getType(), acc, a, b);
            })
       .def("create_dot",
            [](TritonOpBuilder &self, mlir::Value &a, mlir::Value &b,

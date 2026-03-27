@@ -178,6 +178,9 @@ void init_triton_cpu_passes_ttcpuir(py::module &&m) {
   m.def("add_ukernels_to_xsmm_llvmir", [](mlir::PassManager &pm) {
     pm.addPass(mlir::triton::cpu::createUkernelOpsToXSMMLLVMPass());
   });
+  m.def("add_neon_sdot_to_llvmir", [](mlir::PassManager &pm) {
+    pm.addPass(mlir::triton::cpu::createNeonSdotToLLVMPass());
+  });
   m.def("add_expand_strided_metadata", [](mlir::PassManager &pm) {
     pm.addPass(mlir::memref::createExpandStridedMetadataPass());
   });

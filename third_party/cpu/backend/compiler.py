@@ -197,7 +197,11 @@ class CPUBackend(BaseBackend):
         cpu.passes.ttcpuir.add_convert_elem_manip_ops(pm)
         cpu.passes.ttcpuir.add_convert_dot_op(pm)
         cpu.passes.ttcpuir.add_convert_histogram_op(pm)
-        cpu.passes.ttcpuir.add_convert_reduction_op(pm, True, False)
+        # Second param: use_multidim_reduction_op=True preserves
+        # vector.MultiDimReductionOp for 2D reductions, enabling the
+        # ConvertDotProduct (BFDOT) pass in make_tttcir to match bf16
+        # dot product patterns: MulFOp(bf16) → ExtFOp → MultiDimReductionOp.
+        cpu.passes.ttcpuir.add_convert_reduction_op(pm, True, True)
         cpu.passes.ttcpuir.add_convert_scan_op(pm)
         cpu.passes.ttcpuir.add_convert_cf_ops(pm)
         cpu.passes.ttcpuir.add_convert_atomic_ops(pm)
@@ -275,6 +279,10 @@ class CPUBackend(BaseBackend):
             cpu.passes.ttcpuir.add_ukernels_to_onednn_llvmir(pm)
         if options.get_ukernels() == Ukernels.XSMM:
             cpu.passes.ttcpuir.add_ukernels_to_xsmm_llvmir(pm)
+        # TLE-CPU: lower NeonSdotOp to LLVM intrinsic
+        import platform
+        if platform.machine() in ("aarch64", "arm64"):
+            cpu.passes.ttcpuir.add_neon_sdot_to_llvmir(pm)
         cpu.passes.ttcpuir.add_lower_vector_multi_dim(pm)
         cpu.passes.ttcpuir.add_expand_strided_metadata(pm)
         cpu.passes.ttcpuir.add_vector_to_scf(pm, True, 1, False)
@@ -344,7 +352,17 @@ class CPUBackend(BaseBackend):
             Path(asm_path).write_text(src)
             lib_dirs = cpu_driver.library_dirs
             libs = ["m", "TritonCPURuntime", "sleef"]
-            so = _build("kernel", asm_path, tmpdir, lib_dirs, cpu_driver.include_dirs, libs)
+            # TLE-CPU: compile and link registered NEON C functions
+            extra_objs = []
+            try:
+                from triton.language.extra.cpu.neon import get_all_object_files
+                extra_objs = get_all_object_files()
+            except ImportError:
+                pass
+            if extra_objs:
+                libs.append("gomp")  # NEON functions use OpenMP
+            so = _build("kernel", asm_path, tmpdir, lib_dirs,
+                        cpu_driver.include_dirs, libs, extra_objects=extra_objs)
             with open(so, "rb") as f:
                 return f.read()
 

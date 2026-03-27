@@ -60,6 +60,11 @@ public:
     addIllegalOp<triton::ClampFOp>();
     addIllegalOp<triton::FpToFpOp>();
     addIllegalOp<triton::ExternElementwiseOp>();
+    addIllegalOp<triton::CpuNeonSdotOp>();
+    // TLE-CPU ops pass through to LLVM lowering (pointer+scalar args only)
+    addLegalOp<triton::CpuSdotGemvOp>();
+    addLegalOp<triton::CpuSdotGemvFusedBf16Op>();
+    addLegalOp<triton::CpuSdotPackWeightsOp>();
   }
 };
 
@@ -253,6 +258,10 @@ struct ConvertElementwiseOps
     patterns.add<OpTypeConversion<triton::ExternElementwiseOp,
                                   triton::cpu::ExternElementwiseOp>>(
         typeConverter, context);
+    patterns.add<OpTypeConversion<triton::CpuNeonSdotOp,
+                                  triton::cpu::NeonSdotOp>>(
+        typeConverter, context);
+    // CpuSdotGemvOp: no conversion needed, passes through to LLVM lowering
     patterns.add<MulhiUIOpConversion>(typeConverter, context);
     patterns.add<ClampFOpConversion>(typeConverter, context);
     patterns.add<FpToFpOpConversion>(typeConverter, context);

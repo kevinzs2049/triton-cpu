@@ -411,11 +411,18 @@ LogicalResult convertCandidate(SVE2I8MMDotOpCandidate &candidate,
       cTy.getDimSize(1) != N)
     return rewriter.notifyMatchFailure(op, "shape mismatch");
 
-  // Fixed 128-bit SVE width micro-kernel: 2x2x8 or 2x2x16 (smmla).
-  // Accept M==2 (GEMV-like) or M divisible by 4 (standard GEMM).
-  if ((M != 2 && M % 4 != 0) || N % 4 != 0 || K % 8 != 0)
+  // Accept M==1 (SDOT GEMV), M==2 (SMMLA GEMV), or M%4==0 (SMMLA GEMM).
+  // M=1 uses NEON SDOT (4 int8 pairs → 1 int32 per lane, 4 lanes).
+  // M=2+ uses SVE2 SMMLA (2x2x8 tile).
+  if (M == 1) {
+    // M=1 SDOT path: requires K%4==0 (SDOT processes 4 i8 pairs) and N%4==0.
+    if (K % 4 != 0 || N % 4 != 0)
+      return rewriter.notifyMatchFailure(
+          op, "M=1 SDOT requires K%4==0, N%4==0");
+  } else if ((M != 2 && M % 4 != 0) || N % 4 != 0 || K % 8 != 0) {
     return rewriter.notifyMatchFailure(
-        op, "requires M==2 or M%4==0, N%4==0, K%8==0");
+        op, "requires M==1, M==2, or M%4==0; N%4==0; K%8==0 (K%4 for M=1)");
+  }
 
   Type i8Ty = aTy.getElementType();
   Type i32Ty = cTy.getElementType();
@@ -424,6 +431,138 @@ LogicalResult convertCandidate(SVE2I8MMDotOpCandidate &candidate,
 
   StringAttr smmla =
       StringAttr::get(op.getContext(), "llvm.aarch64.sve.smmla.nxv4i32");
+
+  // ── M=1 SDOT path ──────────────────────────────────────────────────────
+  //
+  // For M=1 INT8 DotOp, the inline SDOT approach has too much LLVM codegen
+  // overhead (vector shuffle/insert/extract). Instead, we fall through to
+  // ConvertDotGeneric which produces SMLAL (similar throughput for M=1).
+  //
+  // For high-performance M=1 INT8 GEMV, FlagGems calls the
+  // sdot_gemv_m1_prepacked() runtime function (in runtime_sdot.cpp)
+  // directly from Python via pre-packed weights. This is handled at the
+  // FlagGems dispatch level, not in this LLVM pass.
+  //
+  // We still accept M=1 here to avoid rejecting it entirely, but let it
+  // fall through to the generic path below.
+  if (M == 1) {
+    Value A = op.getA();   // [1, K] i8
+    Value B = op.getB();   // [K, N] i8
+    Value res = op.getC(); // [1, N] i32
+
+    auto v4i32Ty = VectorType::get({4}, i32Ty);
+    auto v16i8Ty = VectorType::get({16}, i8Ty);
+    auto v4i8Ty = VectorType::get({4}, i8Ty);
+    auto v8i8Ty = VectorType::get({8}, i8Ty);
+
+    StringAttr sdot =
+        StringAttr::get(op.getContext(), "llvm.aarch64.neon.sdot.v4i32.v16i8");
+
+    // Check if weights are pre-packed in SDOT format
+    bool prepacked = false;
+    if (const char *env = std::getenv("TRITON_CPU_INT8_SDOT_PREPACKED"))
+      prepacked = (std::string(env) == "1");
+
+    // Extract A row: A[0, :] → [K] i8
+    Value aRow = rewriter.create<vector::ExtractOp>(loc, A, 0);
+
+    Value result = res;
+
+    for (int64_t n = 0; n < N; n += 4) {
+      Value accInit = rewriter.create<vector::ExtractStridedSliceOp>(
+          loc, rewriter.create<vector::ExtractOp>(loc, result, 0),
+          ArrayRef<int64_t>{n}, ArrayRef<int64_t>{4}, ArrayRef<int64_t>{1});
+      Value acc = accInit;
+
+      for (int64_t k = 0; k < K; k += 4) {
+        // A[k:k+4] → broadcast to 16 bytes
+        Value aSlice = rewriter.create<vector::ExtractStridedSliceOp>(
+            loc, aRow,
+            ArrayRef<int64_t>{k}, ArrayRef<int64_t>{4}, ArrayRef<int64_t>{1});
+        SmallVector<int64_t, 16> broadcastMask;
+        for (int i = 0; i < 16; i++)
+          broadcastMask.push_back(i % 4);
+        Value aZero16 = rewriter.create<arith::ConstantOp>(
+            loc, v16i8Ty, rewriter.getZeroAttr(v16i8Ty));
+        Value a16_pre = rewriter.create<vector::InsertStridedSliceOp>(
+            loc, aSlice, aZero16, ArrayRef<int64_t>{0}, ArrayRef<int64_t>{1});
+        Value aBroadcast = rewriter.create<vector::ShuffleOp>(
+            loc, a16_pre, aZero16, broadcastMask);
+
+        Value bPacked;
+        if (prepacked) {
+          // B is pre-packed: B[k:k+4, n:n+4] already in SDOT lane format.
+          // The 16 bytes at B[k, n]..B[k+3, n+3] (row-major) are already:
+          // [b_k0_n0,b_k1_n0,b_k2_n0,b_k3_n0, b_k0_n1,...,b_k3_n3]
+          // Just extract and flatten to v16i8.
+          SmallVector<Value, 4> bRows;
+          for (int i = 0; i < 4; i++) {
+            Value bRow = rewriter.create<vector::ExtractOp>(loc, B, k + i);
+            bRows.push_back(rewriter.create<vector::ExtractStridedSliceOp>(
+                loc, bRow, ArrayRef<int64_t>{n}, ArrayRef<int64_t>{4},
+                ArrayRef<int64_t>{1}));
+          }
+          // Flatten 4 × v4i8 → v16i8 (row-major = SDOT format when prepacked)
+          bPacked = rewriter.create<arith::ConstantOp>(
+              loc, v16i8Ty, rewriter.getZeroAttr(v16i8Ty));
+          for (int i = 0; i < 4; i++) {
+            bPacked = rewriter.create<vector::InsertStridedSliceOp>(
+                loc, bRows[i], bPacked,
+                ArrayRef<int64_t>{i * 4}, ArrayRef<int64_t>{1});
+          }
+        } else {
+          // Row-major B: need 4×4 transpose to SDOT lane format
+          SmallVector<Value, 4> bRows;
+          for (int i = 0; i < 4; i++) {
+            Value bRow = rewriter.create<vector::ExtractOp>(loc, B, k + i);
+            bRows.push_back(rewriter.create<vector::ExtractStridedSliceOp>(
+                loc, bRow, ArrayRef<int64_t>{n}, ArrayRef<int64_t>{4},
+                ArrayRef<int64_t>{1}));
+          }
+          // Pack into v8i8 pairs and shuffle-transpose
+          Value r01 = rewriter.create<arith::ConstantOp>(
+              loc, v8i8Ty, rewriter.getZeroAttr(v8i8Ty));
+          r01 = rewriter.create<vector::InsertStridedSliceOp>(
+              loc, bRows[0], r01, ArrayRef<int64_t>{0}, ArrayRef<int64_t>{1});
+          r01 = rewriter.create<vector::InsertStridedSliceOp>(
+              loc, bRows[1], r01, ArrayRef<int64_t>{4}, ArrayRef<int64_t>{1});
+          Value r23 = rewriter.create<arith::ConstantOp>(
+              loc, v8i8Ty, rewriter.getZeroAttr(v8i8Ty));
+          r23 = rewriter.create<vector::InsertStridedSliceOp>(
+              loc, bRows[2], r23, ArrayRef<int64_t>{0}, ArrayRef<int64_t>{1});
+          r23 = rewriter.create<vector::InsertStridedSliceOp>(
+              loc, bRows[3], r23, ArrayRef<int64_t>{4}, ArrayRef<int64_t>{1});
+          Value r01_16 = rewriter.create<arith::ConstantOp>(
+              loc, v16i8Ty, rewriter.getZeroAttr(v16i8Ty));
+          r01_16 = rewriter.create<vector::InsertStridedSliceOp>(
+              loc, r01, r01_16, ArrayRef<int64_t>{0}, ArrayRef<int64_t>{1});
+          Value r23_16 = rewriter.create<arith::ConstantOp>(
+              loc, v16i8Ty, rewriter.getZeroAttr(v16i8Ty));
+          r23_16 = rewriter.create<vector::InsertStridedSliceOp>(
+              loc, r23, r23_16, ArrayRef<int64_t>{0}, ArrayRef<int64_t>{1});
+          SmallVector<int64_t, 16> concatTranspose = {
+              0, 4, 16, 20, 1, 5, 17, 21, 2, 6, 18, 22, 3, 7, 19, 23};
+          bPacked = rewriter.create<vector::ShuffleOp>(
+              loc, r01_16, r23_16, concatTranspose);
+        }
+
+        // SDOT
+        acc = rewriter.create<LLVM::CallIntrinsicOp>(
+                         loc, v4i32Ty, sdot,
+                         ValueRange{acc, aBroadcast, bPacked},
+                         LLVM::FastmathFlagsAttr())
+                  .getResult(0);
+      }
+
+      Value resRow = rewriter.create<vector::ExtractOp>(loc, result, 0);
+      resRow = rewriter.create<vector::InsertStridedSliceOp>(
+          loc, acc, resRow, ArrayRef<int64_t>{n}, ArrayRef<int64_t>{1});
+      result = rewriter.create<vector::InsertOp>(loc, resRow, result, 0);
+    }
+
+    rewriter.replaceOp(op, result);
+    return success();
+  }
 
   // Dispatch to specialized M=2 GEMV path
   if (M == 2)
