@@ -40,6 +40,37 @@ def TTC_ExternElementwiseOp : TTC_Op<"extern_elementwise", [Elementwise,
     let assemblyFormat = "operands attr-dict `:` functional-type(operands, $result)";
 }
 
+//
+// NEON SDOT: signed int8 dot product (4-lane, 4 pairs each)
+// acc[i] += sum_{k=0}^{3}(a[i*4+k] * b[i*4+k])  for i in 0..3
+//
+def TTC_NeonSdotOp : TTC_Op<"neon_sdot", [Pure]> {
+    let summary = "NEON SDOT: 4-lane signed int8 dot product accumulate";
+
+    let description = [{
+        Computes NEON SDOT (signed dot product) on ARM64.
+        Takes accumulator (vector<4xi32>), two operands (vector<16xi8>),
+        and returns updated accumulator (vector<4xi32>).
+
+        Each lane computes: acc[i] += sum_{k=0}^{3}(a[i*4+k] * b[i*4+k])
+
+        Lowered to: llvm.aarch64.neon.sdot.v4i32.v16i8 intrinsic.
+
+        Usage in TLE CPU:
+          acc = tle.cpu.sdot(acc, a_broadcast, b_packed)
+    }];
+
+    let arguments = (ins
+        TTC_Type:$acc,
+        TTC_Type:$a,
+        TTC_Type:$b
+    );
+
+    let results = (outs TTC_Type:$result);
+
+    let assemblyFormat = "$acc `,` $a `,` $b attr-dict `:` type($acc) `,` type($a) `,` type($b) `->` type($result)";
+}
+
 def TTC_ExtractMemRefOp : TTC_Op<"extract_memref", [NoMemoryEffect]> {
   let summary = "Extract base memref from a block pointer";
 

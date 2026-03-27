@@ -806,6 +806,72 @@ def TT_ExternElementwiseOp : TT_Op<"extern_elementwise", [Elementwise,
 }
 
 //
+// TLE-CPU: NEON SDOT intrinsic op
+//
+def TT_CpuNeonSdotOp : TT_Op<"cpu_neon_sdot", [Pure]> {
+    let summary = "NEON SDOT: 4-lane signed int8 dot product accumulate";
+    let description = [{
+      TLE-CPU primitive. Computes NEON SDOT (signed dot product) on ARM64.
+      acc: tensor<4xi32>, a: tensor<16xi8>, b: tensor<16xi8> -> tensor<4xi32>
+      Lowered to: llvm.aarch64.neon.sdot.v4i32.v16i8 intrinsic.
+    }];
+    let arguments = (ins TT_Type:$acc, TT_Type:$a, TT_Type:$b);
+    let results = (outs TT_Type:$result);
+    let assemblyFormat = "$acc `,` $a `,` $b attr-dict `:` type($acc) `,` type($a) `,` type($b) `->` type($result)";
+}
+
+//
+// TLE-CPU: SDOT GEMV micro-kernel (M=1 INT8 GEMV with pre-packed weights)
+// Calls sdot_gemv_m1_prepacked() from libTritonCPURuntime.so
+//
+def TT_CpuSdotGemvOp : TT_Op<"cpu_sdot_gemv", []> {
+    let summary = "TLE-CPU: M=1 INT8 GEMV micro-kernel using NEON SDOT";
+    let description = [{
+      Performs M=1 INT8 GEMV with pre-packed weights via NEON SDOT.
+      A: [K] int8, B_packed: [K//4, N//4, 4, 4] int8, C: [N] int32 output.
+      Calls the sdot_gemv_m1_prepacked runtime function in libTritonCPURuntime.so.
+      OMP parallelized internally.
+    }];
+    let arguments = (ins
+        TT_Ptr:$a_ptr,
+        TT_Ptr:$b_packed_ptr,
+        TT_Ptr:$c_ptr,
+        I64:$K,
+        I64:$N
+    );
+    let results = (outs);
+    let assemblyFormat = "$a_ptr `,` $b_packed_ptr `,` $c_ptr `,` $K `,` $N attr-dict `:` type($a_ptr) `,` type($b_packed_ptr) `,` type($c_ptr)";
+}
+
+//
+// TLE-CPU: Fused BF16→INT8 quant + SDOT GEMV + dequant→BF16
+//
+def TT_CpuSdotGemvFusedBf16Op : TT_Op<"cpu_sdot_gemv_fused_bf16", []> {
+    let summary = "TLE-CPU: Fused BF16 INT8 GEMV with dynamic activation quantization";
+    let description = [{
+      Fused: BF16 activation → dynamic INT8 quantization → SDOT GEMV → dequant → BF16 output.
+      Eliminates Python-side abs/div/clamp/to overhead.
+      x: [K] bf16, B_packed: SDOT format, w_scale: [N] fp32, out: [N] bf16.
+    }];
+    let arguments = (ins TT_Ptr:$x_ptr, TT_Ptr:$b_packed_ptr,
+                         TT_Ptr:$w_scale_ptr, TT_Ptr:$out_ptr,
+                         I64:$K, I64:$N);
+    let results = (outs);
+    let assemblyFormat = "$x_ptr `,` $b_packed_ptr `,` $w_scale_ptr `,` $out_ptr `,` $K `,` $N attr-dict `:` type($x_ptr) `,` type($b_packed_ptr) `,` type($w_scale_ptr) `,` type($out_ptr)";
+}
+
+//
+// TLE-CPU: Pack weights for SDOT
+//
+def TT_CpuSdotPackWeightsOp : TT_Op<"cpu_sdot_pack_weights", []> {
+    let summary = "TLE-CPU: Pack INT8 weights from row-major to SDOT lane format";
+    let arguments = (ins TT_Ptr:$b_ptr, TT_Ptr:$b_packed_ptr,
+                         I64:$K, I64:$N);
+    let results = (outs);
+    let assemblyFormat = "$b_ptr `,` $b_packed_ptr `,` $K `,` $N attr-dict `:` type($b_ptr) `,` type($b_packed_ptr)";
+}
+
+//
 // Make Range Op
 //
 def TT_MakeRangeOp : TT_Op<"make_range", [Pure]> {

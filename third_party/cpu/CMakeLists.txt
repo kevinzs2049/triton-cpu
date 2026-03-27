@@ -56,8 +56,18 @@ if(xsmm_FOUND)
   set(TRITON_CPU_RUNTIME_LIBS ${TRITON_CPU_RUNTIME_LIBS} ${LIBXSMM})
 endif()
 
+# NEON SDOT runtime for ARM64 INT8 GEMV
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+  set(TRITON_CPU_RUNTIME_SOURCES ${TRITON_CPU_RUNTIME_SOURCES} ${CMAKE_CURRENT_SOURCE_DIR}/runtime/runtime_sdot.cpp)
+endif()
+
 add_library(TritonCPURuntime SHARED ${TRITON_CPU_RUNTIME_SOURCES})
 target_link_libraries(TritonCPURuntime PRIVATE ${TRITON_CPU_RUNTIME_LIBS})
+# OpenMP for SDOT runtime parallelization
+find_package(OpenMP)
+if(OpenMP_CXX_FOUND)
+  target_link_libraries(TritonCPURuntime PRIVATE OpenMP::OpenMP_CXX)
+endif()
 
 # Build and link sleef
 set(SLEEF_BUILD_SHARED_LIBS ON CACHE BOOL "Build sleef shared lib" FORCE)
