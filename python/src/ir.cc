@@ -1582,6 +1582,29 @@ void init_triton_ir(py::module &&m) {
                throw pybind11::index_error("program_id must be in [0,3]");
              return self.create<GetNumProgramsOp>(axis);
            })
+      .def("create_cpu_fused_mlp",
+           [](TritonOpBuilder &self, mlir::Value &x, mlir::Value &gp,
+              mlir::Value &up, mlir::Value &gs, mlir::Value &us,
+              mlir::Value &out, mlir::Value &K, mlir::Value &N) {
+             self.create<CpuFusedMlpOp>(x, gp, up, gs, us, out, K, N);
+           })
+      .def("create_cpu_flash_attn_decode",
+           [](TritonOpBuilder &self, mlir::Value &q, mlir::Value &k,
+              mlir::Value &v, mlir::Value &out,
+              mlir::Value &seq_len, mlir::Value &head_dim,
+              float sm_scale,
+              mlir::Value &num_heads, mlir::Value &num_kv_heads,
+              mlir::Value &stride_kn, mlir::Value &stride_vn) {
+             self.create<CpuFlashAttnDecodeOp>(
+                 q, k, v, out, seq_len, head_dim,
+                 self.getBuilder().getF32FloatAttr(sm_scale),
+                 num_heads, num_kv_heads, stride_kn, stride_vn);
+           })
+      .def("create_cpu_swiglu",
+           [](TritonOpBuilder &self, mlir::Value &gate, mlir::Value &up,
+              mlir::Value &out, mlir::Value &N) {
+             self.create<CpuSwigluOp>(gate, up, out, N);
+           })
       .def("create_cpu_sdot_gemv",
            [](TritonOpBuilder &self, mlir::Value &a_ptr, mlir::Value &b_ptr,
               mlir::Value &c_ptr, mlir::Value &K, mlir::Value &N) {

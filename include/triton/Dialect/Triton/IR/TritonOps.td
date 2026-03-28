@@ -806,6 +806,45 @@ def TT_ExternElementwiseOp : TT_Op<"extern_elementwise", [Elementwise,
 }
 
 //
+// TLE-CPU: Fused MLP (gate GEMV + up GEMV + SWIGLU)
+//
+def TT_CpuFusedMlpOp : TT_Op<"cpu_fused_mlp", []> {
+    let summary = "TLE-CPU: Fused MLP = gate SDOT GEMV + up SDOT GEMV + SWIGLU";
+    let arguments = (ins TT_Ptr:$x_ptr,
+                         TT_Ptr:$gate_packed_ptr, TT_Ptr:$up_packed_ptr,
+                         TT_Ptr:$gate_scale_ptr, TT_Ptr:$up_scale_ptr,
+                         TT_Ptr:$out_ptr,
+                         I64:$K, I64:$N);
+    let results = (outs);
+    let assemblyFormat = "$x_ptr `,` $gate_packed_ptr `,` $up_packed_ptr `,` $gate_scale_ptr `,` $up_scale_ptr `,` $out_ptr `,` $K `,` $N attr-dict `:` type($x_ptr) `,` type($gate_packed_ptr) `,` type($up_packed_ptr) `,` type($gate_scale_ptr) `,` type($up_scale_ptr) `,` type($out_ptr)";
+}
+
+//
+// TLE-CPU: Flash Attention Decode (M=1, online softmax)
+//
+def TT_CpuFlashAttnDecodeOp : TT_Op<"cpu_flash_attn_decode", []> {
+    let summary = "TLE-CPU: M=1 Flash Attention with online softmax";
+    let arguments = (ins TT_Ptr:$q_ptr, TT_Ptr:$k_ptr, TT_Ptr:$v_ptr,
+                         TT_Ptr:$out_ptr,
+                         I64:$seq_len, I64:$head_dim,
+                         F32Attr:$sm_scale,
+                         I64:$num_heads, I64:$num_kv_heads,
+                         I64:$stride_kn, I64:$stride_vn);
+    let results = (outs);
+    let assemblyFormat = "$q_ptr `,` $k_ptr `,` $v_ptr `,` $out_ptr `,` $seq_len `,` $head_dim `,` $num_heads `,` $num_kv_heads `,` $stride_kn `,` $stride_vn attr-dict `:` type($q_ptr) `,` type($k_ptr) `,` type($v_ptr) `,` type($out_ptr)";
+}
+
+//
+// TLE-CPU: Fused SWIGLU (silu(gate) * up)
+//
+def TT_CpuSwigluOp : TT_Op<"cpu_swiglu", []> {
+    let summary = "TLE-CPU: Fused SWIGLU activation (silu(gate) * up)";
+    let arguments = (ins TT_Ptr:$gate_ptr, TT_Ptr:$up_ptr, TT_Ptr:$out_ptr, I64:$N);
+    let results = (outs);
+    let assemblyFormat = "$gate_ptr `,` $up_ptr `,` $out_ptr `,` $N attr-dict `:` type($gate_ptr) `,` type($up_ptr) `,` type($out_ptr)";
+}
+
+//
 // TLE-CPU: NEON SDOT intrinsic op
 //
 def TT_CpuNeonSdotOp : TT_Op<"cpu_neon_sdot", [Pure]> {

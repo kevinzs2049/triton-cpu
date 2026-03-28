@@ -44,6 +44,89 @@ def sdot_gemv(a_ptr, b_packed_ptr, c_ptr, K, N, _builder=None):
 
 
 @builtin
+def fused_mlp(x_ptr, gate_packed_ptr, up_packed_ptr,
+               gate_scale_ptr, up_scale_ptr, out_ptr, K, N, _builder=None):
+    """TLE-CPU: Fused MLP = gate SDOT GEMV + up SDOT GEMV + SWIGLU.
+
+    Single OMP region replaces 3 separate ops (gate_proj, up_proj, silu_and_mul).
+
+    Args:
+        x_ptr: [K] bf16 activation
+        gate_packed_ptr, up_packed_ptr: [K/4, N/4, 16] int8 SDOT-packed weights
+        gate_scale_ptr, up_scale_ptr: [N] fp32 per-channel weight scales
+        out_ptr: [N] bf16 output
+        K, N: dimensions
+    """
+    K_raw = _unwrap_if_constexpr(K)
+    N_raw = _unwrap_if_constexpr(N)
+    K_val = K_raw.handle if hasattr(K_raw, 'handle') else _builder.get_int64(K_raw)
+    N_val = N_raw.handle if hasattr(N_raw, 'handle') else _builder.get_int64(N_raw)
+    _builder.create_cpu_fused_mlp(
+        x_ptr.handle, gate_packed_ptr.handle, up_packed_ptr.handle,
+        gate_scale_ptr.handle, up_scale_ptr.handle, out_ptr.handle,
+        K_val, N_val)
+    return None
+
+
+@builtin
+def flash_attn_decode(q_ptr, k_ptr, v_ptr, out_ptr,
+                       seq_len, head_dim, sm_scale,
+                       num_heads, num_kv_heads,
+                       stride_kn, stride_vn, _builder=None):
+    """TLE-CPU: M=1 Flash Attention with NEON online softmax.
+
+    Replaces ATen SDPA fallback for decode (M=1). Per-row online softmax,
+    NEON dot product for Q·K^T, OMP parallelized across heads.
+
+    Args:
+        q_ptr: [num_heads, head_dim] bf16
+        k_ptr: [num_kv_heads, seq_len, head_dim] bf16
+        v_ptr: [num_kv_heads, seq_len, head_dim] bf16
+        out_ptr: [num_heads, head_dim] bf16
+        seq_len, head_dim: dimensions
+        sm_scale: softmax scale (typically head_dim^-0.5)
+        num_heads, num_kv_heads: head counts (GQA support)
+        stride_kn, stride_vn: strides for K,V along seq_len dim
+    """
+    vals = {}
+    for name, v in [('seq_len', seq_len), ('head_dim', head_dim),
+                     ('num_heads', num_heads), ('num_kv_heads', num_kv_heads),
+                     ('stride_kn', stride_kn), ('stride_vn', stride_vn)]:
+        raw = _unwrap_if_constexpr(v)
+        vals[name] = raw.handle if hasattr(raw, 'handle') else _builder.get_int64(raw)
+    sm_scale_val = _unwrap_if_constexpr(sm_scale)
+    if hasattr(sm_scale_val, 'handle'):
+        sm_f = 0.0  # will be set from handle
+    else:
+        sm_f = float(sm_scale_val)
+    _builder.create_cpu_flash_attn_decode(
+        q_ptr.handle, k_ptr.handle, v_ptr.handle, out_ptr.handle,
+        vals['seq_len'], vals['head_dim'], sm_f,
+        vals['num_heads'], vals['num_kv_heads'],
+        vals['stride_kn'], vals['stride_vn'])
+    return None
+
+
+@builtin
+def swiglu(gate_ptr, up_ptr, out_ptr, N, _builder=None):
+    """TLE-CPU: Fused SWIGLU activation: out = silu(gate) * up.
+
+    Single NEON kernel replaces F.silu(gate) * up (2 ATen calls).
+    BF16 input/output. Single-threaded (optimal for decode N <= 6144).
+
+    Args:
+        gate_ptr: pointer to [N] bfloat16 gate values
+        up_ptr: pointer to [N] bfloat16 up values
+        out_ptr: pointer to [N] bfloat16 output
+        N: number of elements
+    """
+    N_raw = _unwrap_if_constexpr(N)
+    N_val = N_raw.handle if hasattr(N_raw, 'handle') else _builder.get_int64(N_raw)
+    _builder.create_cpu_swiglu(gate_ptr.handle, up_ptr.handle, out_ptr.handle, N_val)
+    return None
+
+
+@builtin
 def sdot_gemv_fused_bf16(x_ptr, b_packed_ptr, w_scale_ptr, out_ptr, K, N, _builder=None):
     """TLE-CPU: Fused BF16→INT8 quant + SDOT GEMV + dequant→BF16.
 
