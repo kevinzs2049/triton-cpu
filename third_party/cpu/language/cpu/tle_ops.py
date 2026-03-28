@@ -44,6 +44,59 @@ def sdot_gemv(a_ptr, b_packed_ptr, c_ptr, K, N, _builder=None):
 
 
 @builtin
+def fused_transformer_layer(
+    hidden_ptr,
+    wq_ptr, wk_ptr, wv_ptr, wo_ptr,
+    wq_s_ptr, wk_s_ptr, wv_s_ptr, wo_s_ptr,
+    q_norm_ptr, k_norm_ptr,
+    cos_ptr, sin_ptr,
+    k_cache_ptr, v_cache_ptr,
+    cache_pos, max_seq_len,
+    gate_ptr, up_ptr, down_ptr,
+    gate_s_ptr, up_s_ptr, down_s_ptr,
+    input_norm_ptr, post_norm_ptr,
+    hidden_dim, head_dim, n_heads, n_kv_heads, intermediate,
+    rms_eps,
+    _builder=None):
+    """TLE-CPU: Full transformer decode layer in one C call.
+
+    RMSNorm → QKV GEMV → QK_Norm → RoPE → KV_cache → Attention →
+    O_GEMV → Residual → RMSNorm → Gate+Up+SWIGLU → Down_GEMV → Residual.
+
+    Zero tensor allocation. Zero Python dispatch within layer.
+    """
+    def _i64(v):
+        raw = _unwrap_if_constexpr(v)
+        if hasattr(raw, 'handle'):
+            # Always cast to i64 to handle i32 kernel args
+            handle = raw.handle
+            i64_ty = _builder.get_int64_ty()
+            try:
+                handle = _builder.create_int_cast(handle, i64_ty, True)
+            except Exception:
+                pass
+            return handle
+        return _builder.get_int64(raw)
+
+    rms_f = float(_unwrap_if_constexpr(rms_eps))
+
+    _builder.create_cpu_fused_transformer_layer(
+        hidden_ptr.handle,
+        wq_ptr.handle, wk_ptr.handle, wv_ptr.handle, wo_ptr.handle,
+        wq_s_ptr.handle, wk_s_ptr.handle, wv_s_ptr.handle, wo_s_ptr.handle,
+        q_norm_ptr.handle, k_norm_ptr.handle,
+        cos_ptr.handle, sin_ptr.handle,
+        k_cache_ptr.handle, v_cache_ptr.handle,
+        _i64(cache_pos), _i64(max_seq_len),
+        gate_ptr.handle, up_ptr.handle, down_ptr.handle,
+        gate_s_ptr.handle, up_s_ptr.handle, down_s_ptr.handle,
+        input_norm_ptr.handle, post_norm_ptr.handle,
+        _i64(hidden_dim), _i64(head_dim), _i64(n_heads), _i64(n_kv_heads),
+        _i64(intermediate), rms_f)
+    return None
+
+
+@builtin
 def fused_mlp(x_ptr, gate_packed_ptr, up_packed_ptr,
                gate_scale_ptr, up_scale_ptr, out_ptr, K, N, _builder=None):
     """TLE-CPU: Fused MLP = gate SDOT GEMV + up SDOT GEMV + SWIGLU.

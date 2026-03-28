@@ -806,6 +806,34 @@ def TT_ExternElementwiseOp : TT_Op<"extern_elementwise", [Elementwise,
 }
 
 //
+// TLE-CPU: Fused Transformer Decode Layer
+//
+def TT_CpuFusedTransformerLayerOp : TT_Op<"cpu_fused_transformer_layer", []> {
+    let summary = "TLE-CPU: Full transformer decode layer in one C call";
+    let description = [{
+      RMSNorm → QKV GEMV → QK_Norm → RoPE → KV_cache_write →
+      Attention → O_GEMV → Residual → RMSNorm → Gate+Up+SWIGLU → Down_GEMV → Residual.
+      Zero tensor allocation. Zero Python dispatch within layer.
+    }];
+    let arguments = (ins
+        TT_Ptr:$hidden_states,
+        TT_Ptr:$wq, TT_Ptr:$wk, TT_Ptr:$wv, TT_Ptr:$wo,
+        TT_Ptr:$wq_s, TT_Ptr:$wk_s, TT_Ptr:$wv_s, TT_Ptr:$wo_s,
+        TT_Ptr:$q_norm_w, TT_Ptr:$k_norm_w,
+        TT_Ptr:$cos_emb, TT_Ptr:$sin_emb,
+        TT_Ptr:$k_cache, TT_Ptr:$v_cache,
+        I64:$cache_pos, I64:$max_seq_len,
+        TT_Ptr:$gate_w, TT_Ptr:$up_w, TT_Ptr:$down_w,
+        TT_Ptr:$gate_s, TT_Ptr:$up_s, TT_Ptr:$down_s,
+        TT_Ptr:$input_norm_w, TT_Ptr:$post_norm_w,
+        I64:$hidden_dim, I64:$head_dim, I64:$n_heads, I64:$n_kv_heads,
+        I64:$intermediate, F32Attr:$rms_eps
+    );
+    let results = (outs);
+    let assemblyFormat = "operands attr-dict `:` type(operands)";
+}
+
+//
 // TLE-CPU: Fused MLP (gate GEMV + up GEMV + SWIGLU)
 //
 def TT_CpuFusedMlpOp : TT_Op<"cpu_fused_mlp", []> {

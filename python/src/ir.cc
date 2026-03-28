@@ -1582,6 +1582,31 @@ void init_triton_ir(py::module &&m) {
                throw pybind11::index_error("program_id must be in [0,3]");
              return self.create<GetNumProgramsOp>(axis);
            })
+      .def("create_cpu_fused_transformer_layer",
+           [](TritonOpBuilder &self,
+              mlir::Value &hidden,
+              mlir::Value &wq, mlir::Value &wk, mlir::Value &wv, mlir::Value &wo,
+              mlir::Value &wq_s, mlir::Value &wk_s, mlir::Value &wv_s, mlir::Value &wo_s,
+              mlir::Value &q_norm, mlir::Value &k_norm,
+              mlir::Value &cos_emb, mlir::Value &sin_emb,
+              mlir::Value &k_cache, mlir::Value &v_cache,
+              mlir::Value &cache_pos, mlir::Value &max_seq,
+              mlir::Value &gate, mlir::Value &up, mlir::Value &down,
+              mlir::Value &gate_s, mlir::Value &up_s, mlir::Value &down_s,
+              mlir::Value &in_norm, mlir::Value &post_norm,
+              mlir::Value &hidden_dim, mlir::Value &head_dim,
+              mlir::Value &n_heads, mlir::Value &n_kv_heads,
+              mlir::Value &intermediate, float rms_eps) {
+             self.create<CpuFusedTransformerLayerOp>(
+                 hidden,
+                 wq, wk, wv, wo, wq_s, wk_s, wv_s, wo_s,
+                 q_norm, k_norm, cos_emb, sin_emb,
+                 k_cache, v_cache, cache_pos, max_seq,
+                 gate, up, down, gate_s, up_s, down_s,
+                 in_norm, post_norm,
+                 hidden_dim, head_dim, n_heads, n_kv_heads, intermediate,
+                 self.getBuilder().getF32FloatAttr(rms_eps));
+           })
       .def("create_cpu_fused_mlp",
            [](TritonOpBuilder &self, mlir::Value &x, mlir::Value &gp,
               mlir::Value &up, mlir::Value &gs, mlir::Value &us,

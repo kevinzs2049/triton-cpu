@@ -86,6 +86,100 @@ struct SdotGemvOpLowering : public OpRewritePattern<triton::CpuSdotGemvOp> {
   }
 };
 
+// ---------- CpuFusedTransformerLayerOp → runtime call ----------
+
+struct FusedTransformerLayerOpLowering
+    : public OpRewritePattern<triton::CpuFusedTransformerLayerOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(triton::CpuFusedTransformerLayerOp op,
+                                PatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    auto ctx = rewriter.getContext();
+    auto module = op->getParentOfType<ModuleOp>();
+    auto i64Ty = IntegerType::get(ctx, 64);
+    auto f32Ty = Float32Type::get(ctx);
+    auto ptrTy = LLVM::LLVMPointerType::get(ctx);
+
+    auto funcName = "fused_transformer_decode_layer";
+    auto funcOp = module.lookupSymbol<LLVM::LLVMFuncOp>(funcName);
+    if (!funcOp) {
+      auto voidTy = LLVM::LLVMVoidType::get(ctx);
+      // 26 ptr + 5 i64 + 1 f32 = 32 args
+      SmallVector<Type, 32> argTypes;
+      // hidden_states
+      argTypes.push_back(ptrTy);
+      // wq wk wv wo wq_s wk_s wv_s wo_s (8 ptrs)
+      for (int i = 0; i < 8; i++) argTypes.push_back(ptrTy);
+      // q_norm k_norm cos sin (4 ptrs)
+      for (int i = 0; i < 4; i++) argTypes.push_back(ptrTy);
+      // k_cache v_cache (2 ptrs)
+      argTypes.push_back(ptrTy); argTypes.push_back(ptrTy);
+      // cache_pos max_seq (2 i64)
+      argTypes.push_back(i64Ty); argTypes.push_back(i64Ty);
+      // gate up down gate_s up_s down_s (6 ptrs)
+      for (int i = 0; i < 6; i++) argTypes.push_back(ptrTy);
+      // input_norm post_norm (2 ptrs)
+      argTypes.push_back(ptrTy); argTypes.push_back(ptrTy);
+      // hidden head_dim n_heads n_kv_heads intermediate (5 i64)
+      for (int i = 0; i < 5; i++) argTypes.push_back(i64Ty);
+      // rms_eps (1 f32)
+      argTypes.push_back(f32Ty);
+
+      auto funcType = LLVM::LLVMFunctionType::get(voidTy, argTypes, false);
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(module.getBody());
+      funcOp = rewriter.create<LLVM::LLVMFuncOp>(
+          UnknownLoc::get(ctx), funcName, funcType);
+    }
+
+    auto castPtr = [&](Value v) -> Value {
+      if (isa<LLVM::LLVMPointerType>(v.getType())) return v;
+      return rewriter.create<UnrealizedConversionCastOp>(loc, ptrTy, v)
+          .getResult(0);
+    };
+
+    auto epsVal = rewriter.create<LLVM::ConstantOp>(loc, f32Ty, op.getRmsEpsAttr());
+
+    SmallVector<Value, 32> args;
+    args.push_back(castPtr(op.getHiddenStates()));
+    args.push_back(castPtr(op.getWq()));
+    args.push_back(castPtr(op.getWk()));
+    args.push_back(castPtr(op.getWv()));
+    args.push_back(castPtr(op.getWo()));
+    args.push_back(castPtr(op.getWqS()));
+    args.push_back(castPtr(op.getWkS()));
+    args.push_back(castPtr(op.getWvS()));
+    args.push_back(castPtr(op.getWoS()));
+    args.push_back(castPtr(op.getQNormW()));
+    args.push_back(castPtr(op.getKNormW()));
+    args.push_back(castPtr(op.getCosEmb()));
+    args.push_back(castPtr(op.getSinEmb()));
+    args.push_back(castPtr(op.getKCache()));
+    args.push_back(castPtr(op.getVCache()));
+    args.push_back(op.getCachePos());
+    args.push_back(op.getMaxSeqLen());
+    args.push_back(castPtr(op.getGateW()));
+    args.push_back(castPtr(op.getUpW()));
+    args.push_back(castPtr(op.getDownW()));
+    args.push_back(castPtr(op.getGateS()));
+    args.push_back(castPtr(op.getUpS()));
+    args.push_back(castPtr(op.getDownS()));
+    args.push_back(castPtr(op.getInputNormW()));
+    args.push_back(castPtr(op.getPostNormW()));
+    args.push_back(op.getHiddenDim());
+    args.push_back(op.getHeadDim());
+    args.push_back(op.getNHeads());
+    args.push_back(op.getNKvHeads());
+    args.push_back(op.getIntermediate());
+    args.push_back(epsVal);
+
+    rewriter.create<LLVM::CallOp>(loc, funcOp, args);
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
 // ---------- CpuSdotGemvFusedBf16Op → runtime call ----------
 
 struct SdotGemvFusedBf16OpLowering
@@ -336,6 +430,7 @@ std::unique_ptr<Pass> createNeonSdotToLLVMPass() {
       patterns.add<SwigluOpLowering>(ctx);
       patterns.add<FlashAttnDecodeOpLowering>(ctx);
       patterns.add<FusedMlpOpLowering>(ctx);
+      patterns.add<FusedTransformerLayerOpLowering>(ctx);
       if (failed(applyPatternsGreedily(getOperation(),
                                                std::move(patterns))))
         signalPassFailure();
