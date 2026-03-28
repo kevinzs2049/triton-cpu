@@ -56,9 +56,13 @@ if(xsmm_FOUND)
   set(TRITON_CPU_RUNTIME_LIBS ${TRITON_CPU_RUNTIME_LIBS} ${LIBXSMM})
 endif()
 
-# NEON SDOT runtime for ARM64 INT8 GEMV
+# TLE-CPU NEON runtime for ARM64
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
-  set(TRITON_CPU_RUNTIME_SOURCES ${TRITON_CPU_RUNTIME_SOURCES} ${CMAKE_CURRENT_SOURCE_DIR}/runtime/runtime_sdot.cpp)
+  set(TRITON_CPU_RUNTIME_SOURCES ${TRITON_CPU_RUNTIME_SOURCES}
+    ${CMAKE_CURRENT_SOURCE_DIR}/runtime/runtime_sdot.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/runtime/runtime_swiglu.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/runtime/runtime_flash_attn_decode.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/runtime/runtime_fused_mlp.cpp)
 endif()
 
 add_library(TritonCPURuntime SHARED ${TRITON_CPU_RUNTIME_SOURCES})
