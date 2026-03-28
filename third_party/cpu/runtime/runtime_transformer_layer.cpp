@@ -12,6 +12,7 @@
 #include <arm_neon.h>
 #endif
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -368,21 +369,34 @@ EXPORT void fused_transformer_decode_layer(
     int64_t hidden, int64_t head_dim, int64_t n_heads, int64_t n_kv_heads,
     int64_t intermediate, float rms_eps
 ) {
-  int64_t q_dim = n_heads * head_dim;
-  int64_t kv_dim = n_kv_heads * head_dim;
   int64_t seq_len = cache_pos + 1;
 
-  /* Scratch buffers on stack (max hidden=2048, intermediate=6144) */
-  uint16_t norm_out[8192];     /* max(hidden, q_dim) */
-  uint16_t q_buf[4096];       /* n_heads * head_dim = 2048 */
-  uint16_t k_buf[2048];       /* n_kv_heads * head_dim = 1024 */
-  uint16_t v_buf[2048];
-  uint16_t attn_out[4096];    /* q_dim */
-  uint16_t o_out[8192];       /* hidden */
-  uint16_t mlp_out[8192];     /* hidden */
-  uint16_t mlp_scratch[8192]; /* intermediate */
-  int8_t int8_scratch[8192];  /* max(hidden, intermediate) */
-  uint16_t residual[8192];    /* hidden */
+  /* Scratch buffers — heap allocated for large models (4B+: intermediate=9728) */
+  int64_t q_dim = n_heads * head_dim;
+  int64_t kv_dim = n_kv_heads * head_dim;
+  int64_t max_dim = std::max({hidden, q_dim, intermediate});
+
+  std::vector<uint16_t> norm_out_v(max_dim);
+  std::vector<uint16_t> q_buf_v(q_dim);
+  std::vector<uint16_t> k_buf_v(kv_dim);
+  std::vector<uint16_t> v_buf_v(kv_dim);
+  std::vector<uint16_t> attn_out_v(q_dim);
+  std::vector<uint16_t> o_out_v(hidden);
+  std::vector<uint16_t> mlp_out_v(hidden);
+  std::vector<uint16_t> mlp_scratch_v(intermediate);
+  std::vector<int8_t> int8_scratch_v(max_dim);
+  std::vector<uint16_t> residual_v(hidden);
+
+  uint16_t *norm_out = norm_out_v.data();
+  uint16_t *q_buf = q_buf_v.data();
+  uint16_t *k_buf = k_buf_v.data();
+  uint16_t *v_buf = v_buf_v.data();
+  uint16_t *attn_out = attn_out_v.data();
+  uint16_t *o_out = o_out_v.data();
+  uint16_t *mlp_out = mlp_out_v.data();
+  uint16_t *mlp_scratch = mlp_scratch_v.data();
+  int8_t *int8_scratch = int8_scratch_v.data();
+  uint16_t *residual = residual_v.data();
 
   /* Save residual */
   std::memcpy(residual, hidden_states, hidden * 2);
