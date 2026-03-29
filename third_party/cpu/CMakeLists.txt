@@ -63,7 +63,8 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
     ${CMAKE_CURRENT_SOURCE_DIR}/runtime/runtime_swiglu.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/runtime/runtime_flash_attn_decode.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/runtime/runtime_fused_mlp.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/runtime/runtime_transformer_layer.cpp)
+    ${CMAKE_CURRENT_SOURCE_DIR}/runtime/runtime_transformer_layer.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/runtime/runtime_decode_step.cpp)
 endif()
 
 add_library(TritonCPURuntime SHARED ${TRITON_CPU_RUNTIME_SOURCES})
