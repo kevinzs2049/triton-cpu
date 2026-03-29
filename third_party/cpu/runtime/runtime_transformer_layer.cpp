@@ -404,11 +404,34 @@ EXPORT void fused_transformer_decode_layer(
   /* 1. Input RMSNorm */
   rms_norm_bf16(hidden_states, input_norm_w, norm_out, hidden, rms_eps);
 
-  /* 2. Q/K/V GEMV */
-  float xs_dummy;
-  gemv_int8_bf16(norm_out, hidden, wq, wq_s, q_buf, q_dim, int8_scratch, &xs_dummy);
-  gemv_int8_bf16(norm_out, hidden, wk, wk_s, k_buf, kv_dim, int8_scratch, &xs_dummy);
-  gemv_int8_bf16(norm_out, hidden, wv, wv_s, v_buf, kv_dim, int8_scratch, &xs_dummy);
+  /* 2. Q/K/V GEMV — fused: quantize once, single OMP region for all 3 */
+  {
+    float xs = quantize_bf16_to_int8(norm_out, int8_scratch, hidden);
+    int64_t K4 = hidden / 4;
+    int64_t q_N4 = q_dim / 4, kv_N4 = kv_dim / 4;
+    std::vector<int32_t> q_acc(q_dim), k_acc(kv_dim), v_acc(kv_dim);
+
+    #pragma omp parallel
+    {
+      int nt = omp_get_num_threads();
+      int tid = omp_get_thread_num();
+      /* Q proj */
+      { int64_t ch = (q_N4+nt-1)/nt, s = tid*ch, c = std::min(ch, q_N4-s);
+        if (s < q_N4 && c > 0)
+          sdot_gemv_st(int8_scratch, wq, q_acc.data(), K4, q_N4, s, c); }
+      /* K proj */
+      { int64_t ch = (kv_N4+nt-1)/nt, s = tid*ch, c = std::min(ch, kv_N4-s);
+        if (s < kv_N4 && c > 0)
+          sdot_gemv_st(int8_scratch, wk, k_acc.data(), K4, kv_N4, s, c); }
+      /* V proj */
+      { int64_t ch = (kv_N4+nt-1)/nt, s = tid*ch, c = std::min(ch, kv_N4-s);
+        if (s < kv_N4 && c > 0)
+          sdot_gemv_st(int8_scratch, wv, v_acc.data(), K4, kv_N4, s, c); }
+    }
+    dequant_to_bf16(q_acc.data(), wq_s, xs, q_buf, q_dim);
+    dequant_to_bf16(k_acc.data(), wk_s, xs, k_buf, kv_dim);
+    dequant_to_bf16(v_acc.data(), wv_s, xs, v_buf, kv_dim);
+  }
 
   /* 3. QK Norm */
   for (int64_t h = 0; h < n_heads; h++)
@@ -434,7 +457,8 @@ EXPORT void fused_transformer_decode_layer(
                      max_seq_len);
 
   /* 7. O projection */
-  gemv_int8_bf16(attn_out, q_dim, wo, wo_s, o_out, hidden, int8_scratch, &xs_dummy);
+  float xs_o;
+  gemv_int8_bf16(attn_out, q_dim, wo, wo_s, o_out, hidden, int8_scratch, &xs_o);
 
   /* 8. Residual add */
   residual_add_bf16(residual, o_out, hidden);
