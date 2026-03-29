@@ -44,6 +44,50 @@ def sdot_gemv(a_ptr, b_packed_ptr, c_ptr, K, N, _builder=None):
 
 
 @builtin
+def fused_decode_step(
+    token_id, pos,
+    embed_table_ptr, layer_ptrs_ptr,
+    k_cache_ptr, v_cache_ptr,
+    rope_cos_ptr, rope_sin_ptr,
+    final_norm_ptr,
+    lm_head_packed_ptr, lm_head_scale_ptr,
+    hidden_dim, head_dim, n_heads, n_kv_heads,
+    intermediate, vocab_size, n_layers, max_seq,
+    rms_eps,
+    _builder=None):
+    """TLE-CPU: Full decode step. Returns next token ID (i64).
+
+    embedding → n_layers × transformer layer → final norm → lm_head → argmax.
+    One Triton kernel launch per token.
+    """
+    def _i64(v):
+        raw = _unwrap_if_constexpr(v)
+        if hasattr(raw, 'handle'):
+            handle = raw.handle
+            i64_ty = _builder.get_int64_ty()
+            try:
+                handle = _builder.create_int_cast(handle, i64_ty, True)
+            except Exception:
+                pass
+            return handle
+        return _builder.get_int64(raw)
+
+    rms_f = float(_unwrap_if_constexpr(rms_eps))
+
+    result = _builder.create_cpu_fused_decode_step(
+        _i64(token_id), _i64(pos),
+        embed_table_ptr.handle, layer_ptrs_ptr.handle,
+        k_cache_ptr.handle, v_cache_ptr.handle,
+        rope_cos_ptr.handle, rope_sin_ptr.handle,
+        final_norm_ptr.handle,
+        lm_head_packed_ptr.handle, lm_head_scale_ptr.handle,
+        _i64(hidden_dim), _i64(head_dim), _i64(n_heads), _i64(n_kv_heads),
+        _i64(intermediate), _i64(vocab_size), _i64(n_layers), _i64(max_seq),
+        rms_f)
+    return tensor(result, tl.int64)
+
+
+@builtin
 def fused_transformer_layer(
     hidden_ptr,
     wq_ptr, wk_ptr, wv_ptr, wo_ptr,

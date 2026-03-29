@@ -69,6 +69,7 @@ public:
     addLegalOp<triton::CpuFlashAttnDecodeOp>();
     addLegalOp<triton::CpuFusedMlpOp>();
     addLegalOp<triton::CpuFusedTransformerLayerOp>();
+    addLegalOp<triton::CpuFusedDecodeStepOp>();
   }
 };
 

@@ -86,6 +86,78 @@ struct SdotGemvOpLowering : public OpRewritePattern<triton::CpuSdotGemvOp> {
   }
 };
 
+// ---------- CpuFusedDecodeStepOp → runtime call (returns i64) ----------
+
+struct FusedDecodeStepOpLowering
+    : public OpRewritePattern<triton::CpuFusedDecodeStepOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(triton::CpuFusedDecodeStepOp op,
+                                PatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    auto ctx = rewriter.getContext();
+    auto module = op->getParentOfType<ModuleOp>();
+    auto i64Ty = IntegerType::get(ctx, 64);
+    auto f32Ty = Float32Type::get(ctx);
+    auto ptrTy = LLVM::LLVMPointerType::get(ctx);
+
+    auto funcName = "fused_decode_step";
+    auto funcOp = module.lookupSymbol<LLVM::LLVMFuncOp>(funcName);
+    if (!funcOp) {
+      // 2 i64 + 9 ptr + 8 i64 + 1 f32 = 20 args, returns i64
+      SmallVector<Type, 20> argTypes;
+      argTypes.push_back(i64Ty);  // token_id
+      argTypes.push_back(i64Ty);  // pos
+      for (int i = 0; i < 9; i++) argTypes.push_back(ptrTy);  // 9 ptrs
+      for (int i = 0; i < 8; i++) argTypes.push_back(i64Ty);  // 8 dims
+      argTypes.push_back(f32Ty);  // rms_eps
+      auto funcType = LLVM::LLVMFunctionType::get(i64Ty, argTypes, false);
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(module.getBody());
+      funcOp = rewriter.create<LLVM::LLVMFuncOp>(
+          UnknownLoc::get(ctx), funcName, funcType);
+    }
+
+    auto castPtr = [&](Value v) -> Value {
+      if (isa<LLVM::LLVMPointerType>(v.getType())) return v;
+      return rewriter.create<UnrealizedConversionCastOp>(loc, ptrTy, v)
+          .getResult(0);
+    };
+    auto toI64 = [&](Value v) -> Value {
+      if (v.getType() == i64Ty) return v;
+      return rewriter.create<LLVM::SExtOp>(loc, i64Ty, v);
+    };
+
+    auto epsVal = rewriter.create<LLVM::ConstantOp>(loc, f32Ty, op.getRmsEpsAttr());
+
+    SmallVector<Value, 20> args;
+    args.push_back(toI64(op.getTokenId()));
+    args.push_back(toI64(op.getPos()));
+    args.push_back(castPtr(op.getEmbedTable()));
+    args.push_back(castPtr(op.getLayerPtrs()));
+    args.push_back(castPtr(op.getKCache()));
+    args.push_back(castPtr(op.getVCache()));
+    args.push_back(castPtr(op.getRopeCos()));
+    args.push_back(castPtr(op.getRopeSin()));
+    args.push_back(castPtr(op.getFinalNormW()));
+    args.push_back(castPtr(op.getLmHeadPacked()));
+    args.push_back(castPtr(op.getLmHeadScale()));
+    args.push_back(toI64(op.getHiddenDim()));
+    args.push_back(toI64(op.getHeadDim()));
+    args.push_back(toI64(op.getNHeads()));
+    args.push_back(toI64(op.getNKvHeads()));
+    args.push_back(toI64(op.getIntermediate()));
+    args.push_back(toI64(op.getVocabSize()));
+    args.push_back(toI64(op.getNLayers()));
+    args.push_back(toI64(op.getMaxSeq()));
+    args.push_back(epsVal);
+
+    auto callOp = rewriter.create<LLVM::CallOp>(loc, funcOp, args);
+    rewriter.replaceOp(op, callOp.getResult());
+    return success();
+  }
+};
+
 // ---------- CpuFusedTransformerLayerOp → runtime call ----------
 
 struct FusedTransformerLayerOpLowering
@@ -431,6 +503,7 @@ std::unique_ptr<Pass> createNeonSdotToLLVMPass() {
       patterns.add<FlashAttnDecodeOpLowering>(ctx);
       patterns.add<FusedMlpOpLowering>(ctx);
       patterns.add<FusedTransformerLayerOpLowering>(ctx);
+      patterns.add<FusedDecodeStepOpLowering>(ctx);
       if (failed(applyPatternsGreedily(getOperation(),
                                                std::move(patterns))))
         signalPassFailure();

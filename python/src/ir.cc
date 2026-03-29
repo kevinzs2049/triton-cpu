@@ -1582,6 +1582,26 @@ void init_triton_ir(py::module &&m) {
                throw pybind11::index_error("program_id must be in [0,3]");
              return self.create<GetNumProgramsOp>(axis);
            })
+      .def("create_cpu_fused_decode_step",
+           [](TritonOpBuilder &self,
+              mlir::Value &tok_id, mlir::Value &pos,
+              mlir::Value &embed, mlir::Value &layer_ptrs,
+              mlir::Value &kc, mlir::Value &vc,
+              mlir::Value &rcos, mlir::Value &rsin,
+              mlir::Value &fnorm,
+              mlir::Value &lm_packed, mlir::Value &lm_scale,
+              mlir::Value &hidden, mlir::Value &hd,
+              mlir::Value &nh, mlir::Value &nkv,
+              mlir::Value &inter, mlir::Value &vocab,
+              mlir::Value &nlayers, mlir::Value &maxseq,
+              float rms_eps) -> mlir::Value {
+             auto op = self.create<CpuFusedDecodeStepOp>(
+                 tok_id, pos, embed, layer_ptrs, kc, vc, rcos, rsin,
+                 fnorm, lm_packed, lm_scale,
+                 hidden, hd, nh, nkv, inter, vocab, nlayers, maxseq,
+                 self.getBuilder().getF32FloatAttr(rms_eps));
+             return op.getNextToken();
+           })
       .def("create_cpu_fused_transformer_layer",
            [](TritonOpBuilder &self,
               mlir::Value &hidden,

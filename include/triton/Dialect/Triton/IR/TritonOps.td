@@ -806,6 +806,27 @@ def TT_ExternElementwiseOp : TT_Op<"extern_elementwise", [Elementwise,
 }
 
 //
+// TLE-CPU: Fused Decode Step (embedding → all layers → norm → lm_head → argmax)
+//
+def TT_CpuFusedDecodeStepOp : TT_Op<"cpu_fused_decode_step", []> {
+    let summary = "TLE-CPU: Full decode step in one C call, returns next token ID";
+    let arguments = (ins
+        I64:$token_id, I64:$pos,
+        TT_Ptr:$embed_table,
+        TT_Ptr:$layer_ptrs,
+        TT_Ptr:$k_cache, TT_Ptr:$v_cache,
+        TT_Ptr:$rope_cos, TT_Ptr:$rope_sin,
+        TT_Ptr:$final_norm_w,
+        TT_Ptr:$lm_head_packed, TT_Ptr:$lm_head_scale,
+        I64:$hidden_dim, I64:$head_dim, I64:$n_heads, I64:$n_kv_heads,
+        I64:$intermediate, I64:$vocab_size, I64:$n_layers,
+        I64:$max_seq, F32Attr:$rms_eps
+    );
+    let results = (outs I64:$next_token);
+    let assemblyFormat = "operands attr-dict `:` type(operands)";
+}
+
+//
 // TLE-CPU: Fused Transformer Decode Layer
 //
 def TT_CpuFusedTransformerLayerOp : TT_Op<"cpu_fused_transformer_layer", []> {
