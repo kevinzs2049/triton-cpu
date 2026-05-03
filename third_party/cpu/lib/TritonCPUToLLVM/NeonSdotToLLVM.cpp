@@ -481,6 +481,59 @@ struct RmsNormOpLowering : public OpRewritePattern<triton::CpuRmsNormOp> {
   }
 };
 
+// ---------- CpuCausalConv1dUpdateOp → runtime call ----------
+
+struct CausalConv1dUpdateOpLowering
+    : public OpRewritePattern<triton::CpuCausalConv1dUpdateOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(triton::CpuCausalConv1dUpdateOp op,
+                                PatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    auto ctx = rewriter.getContext();
+    auto module = op->getParentOfType<ModuleOp>();
+    auto i64Ty = IntegerType::get(ctx, 64);
+    auto ptrTy = LLVM::LLVMPointerType::get(ctx);
+
+    auto funcName = "standalone_causal_conv1d_update_bf16";
+    auto funcOp = module.lookupSymbol<LLVM::LLVMFuncOp>(funcName);
+    if (!funcOp) {
+      auto voidTy = LLVM::LLVMVoidType::get(ctx);
+      // 5 ptrs + 4 i64
+      auto funcType = LLVM::LLVMFunctionType::get(
+          voidTy,
+          {ptrTy, ptrTy, ptrTy, ptrTy, ptrTy,
+           i64Ty, i64Ty, i64Ty, i64Ty, i64Ty},
+          false);
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(module.getBody());
+      funcOp = rewriter.create<LLVM::LLVMFuncOp>(
+          UnknownLoc::get(ctx), funcName, funcType);
+    }
+
+    auto castPtr = [&](Value v) -> Value {
+      if (isa<LLVM::LLVMPointerType>(v.getType())) return v;
+      return rewriter.create<UnrealizedConversionCastOp>(loc, ptrTy, v)
+          .getResult(0);
+    };
+
+    SmallVector<Value, 10> args;
+    args.push_back(castPtr(op.getHiddenPtr()));
+    args.push_back(castPtr(op.getStatePtr()));
+    args.push_back(castPtr(op.getWeightPtr()));
+    args.push_back(castPtr(op.getBiasPtr()));
+    args.push_back(castPtr(op.getOutPtr()));
+    args.push_back(op.getB());
+    args.push_back(op.getC());
+    args.push_back(op.getKernelSize());
+    args.push_back(op.getSilu());
+    args.push_back(op.getHasBias());
+    rewriter.create<LLVM::CallOp>(loc, funcOp, args);
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
 // ---------- CpuGatedDeltaDecodeOp → runtime call ----------
 
 struct GatedDeltaDecodeOpLowering
@@ -517,15 +570,20 @@ struct GatedDeltaDecodeOpLowering
           .getResult(0);
     };
 
-    rewriter.create<LLVM::CallOp>(
-        loc, funcOp,
-        ValueRange{castPtr(op.getQPtr()), castPtr(op.getKPtr()),
-                   castPtr(op.getVPtr()), castPtr(op.getGPtr()),
-                   castPtr(op.getBetaPtr()), castPtr(op.getStatePtr()),
-                   castPtr(op.getOutPtr()),
-                   op.getB(), op.getH(),
-                   op.getKDim(), op.getVDim(),
-                   op.getUseL2norm()});
+    SmallVector<Value, 12> args;
+    args.push_back(castPtr(op.getQPtr()));
+    args.push_back(castPtr(op.getKPtr()));
+    args.push_back(castPtr(op.getVPtr()));
+    args.push_back(castPtr(op.getGPtr()));
+    args.push_back(castPtr(op.getBetaPtr()));
+    args.push_back(castPtr(op.getStatePtr()));
+    args.push_back(castPtr(op.getOutPtr()));
+    args.push_back(op.getB());
+    args.push_back(op.getH());
+    args.push_back(op.getKDim());
+    args.push_back(op.getVDim());
+    args.push_back(op.getUseL2norm());
+    rewriter.create<LLVM::CallOp>(loc, funcOp, args);
     rewriter.eraseOp(op);
     return success();
   }
@@ -596,6 +654,7 @@ std::unique_ptr<Pass> createNeonSdotToLLVMPass() {
       patterns.add<SdotPackWeightsOpLowering>(ctx);
       patterns.add<RmsNormOpLowering>(ctx);
       patterns.add<GatedDeltaDecodeOpLowering>(ctx);
+      patterns.add<CausalConv1dUpdateOpLowering>(ctx);
       patterns.add<SwigluOpLowering>(ctx);
       patterns.add<FlashAttnDecodeOpLowering>(ctx);
       patterns.add<FusedMlpOpLowering>(ctx);

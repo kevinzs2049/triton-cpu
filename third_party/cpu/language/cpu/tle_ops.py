@@ -226,6 +226,46 @@ def rms_norm(x_ptr, weight_ptr, out_ptr, D, eps, _builder=None):
 
 
 @builtin
+def causal_conv1d_update(hidden_ptr, state_ptr, weight_ptr, bias_ptr, out_ptr,
+                          B, C, kernel_size, silu, has_bias, _builder=None):
+    """TLE-CPU: Depthwise causal conv1d update (T=1, bf16, kernel_size=4).
+
+    Per (b, c): out[b,c] = sum_k v[b,c,k] * weight[c,k] where
+    v = [state[b,c,0..kernel_size-2], hidden[b,c]]; then roll state by 1.
+    Optional bias (pass null pointer to skip) and SiLU activation.
+
+    Replaces aten::conv1d (groups=C) which has high mkldnn dispatch overhead
+    on Qwen3.5/Qwen3-Next conv state update.
+
+    Args:
+        hidden_ptr: [B, C] bf16 input
+        state_ptr:  [B, C, kernel_size-1] bf16 IN-OUT (rolled)
+        weight_ptr: [C, kernel_size] bf16
+        bias_ptr:   [C] bf16 or null
+        out_ptr:    [B, C] bf16 output
+        B, C, kernel_size: dimensions
+        silu: 1 to apply SiLU, 0 otherwise
+    """
+    def _i64(x):
+        raw = _unwrap_if_constexpr(x)
+        if hasattr(raw, 'handle'):
+            handle = raw.handle
+            i64_ty = _builder.get_int64_ty()
+            try:
+                handle = _builder.create_int_cast(handle, i64_ty, True)
+            except Exception:
+                pass
+            return handle
+        return _builder.get_int64(raw)
+
+    _builder.create_cpu_causal_conv1d_update(
+        hidden_ptr.handle, state_ptr.handle, weight_ptr.handle,
+        bias_ptr.handle, out_ptr.handle,
+        _i64(B), _i64(C), _i64(kernel_size), _i64(silu), _i64(has_bias))
+    return None
+
+
+@builtin
 def gated_delta_decode(q_ptr, k_ptr, v_ptr, g_ptr, beta_ptr,
                        state_ptr, out_ptr,
                        B, H, k_dim, v_dim, use_l2norm,

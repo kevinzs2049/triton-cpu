@@ -656,6 +656,107 @@ EXPORT void standalone_gated_delta_decode_fp32(
                           use_l2norm ? 1 : 0);
 }
 
+/* ═══════════════════════════════════════════════════════════
+ * Causal depthwise conv1d update (T=1 decode), bf16, kernel_size=4.
+ *
+ * Qwen3.5/Qwen3-Next store kernel_size=4 elements in conv_state (NOT
+ * kernel_size-1). The torch reference does:
+ *   cat = [state, hidden_in]                      // [B, C, kernel_size+1]
+ *   state_new = cat[..., -kernel_size:]           // = [s1, s2, s3, h]
+ *   out = conv1d(cat, weight, kernel_size=4, padding=0)[:, :, -1:]
+ *       = sum_k cat[..., 1+k] * weight[c, k]      // = s1*w0+s2*w1+s3*w2+h*w3
+ *
+ * For each (b, c):
+ *   y = state[1]*w0 + state[2]*w1 + state[3]*w2 + hidden_in*w3
+ *   if bias: y += bias[c]
+ *   round y to bf16 with FTZ (matches mkldnn's intermediate output)
+ *   if silu: y = silu_f32(y)
+ *   out[b, c] = bf16(y)
+ *   state[0..3] = [state[1], state[2], state[3], hidden_in]
+ *
+ * Replaces aten::conv1d (depthwise, mkldnn) which has high dispatch
+ * overhead (~700us/call) on Qwen3.5 conv_dim=6144.
+ * ═══════════════════════════════════════════════════════════ */
+
+static inline float silu_f32(float x) {
+  return x / (1.0f + expf(-x));
+}
+
+static inline float bf16_to_f32_scalar(uint16_t b) {
+  uint32_t v = (uint32_t)b << 16;
+  float f;
+  std::memcpy(&f, &v, sizeof(f));
+  return f;
+}
+
+static inline uint16_t f32_to_bf16_scalar(float f) {
+  uint32_t v;
+  std::memcpy(&v, &f, sizeof(v));
+  // round-to-nearest-even
+  uint32_t lsb = (v >> 16) & 1u;
+  uint32_t rounding = 0x7FFFu + lsb;
+  return (uint16_t)((v + rounding) >> 16);
+}
+
+// FTZ variant: flush bf16 subnormals to zero (preserve sign). Matches
+// mkldnn's behavior on intermediate bf16 conv outputs.
+static inline uint16_t f32_to_bf16_scalar_ftz(float f) {
+  uint16_t r = f32_to_bf16_scalar(f);
+  if ((r & 0x7F80u) == 0) r &= 0x8000u;
+  return r;
+}
+
+static void causal_conv1d_update_bf16_kn4(
+    const uint16_t *hidden_in,  // [B, C]
+    uint16_t *conv_state,       // [B, C, 4]  IN-OUT  (state_len = kernel_size)
+    const uint16_t *weight,     // [C, 4]
+    const uint16_t *bias,       // [C] or NULL
+    uint16_t *out,              // [B, C]
+    int silu,
+    int64_t B, int64_t C) {
+  #pragma omp parallel for collapse(2) schedule(static)
+  for (int64_t b = 0; b < B; b++) {
+    for (int64_t c = 0; c < C; c++) {
+      uint16_t *st = conv_state + (b * C + c) * 4;
+      const uint16_t *w = weight + c * 4;
+      const uint16_t h = hidden_in[b * C + c];
+      // Conv reads state[1..3] + hidden_in (NOT state[0..2]+hidden_in):
+      // mirrors the last position output of mkldnn's bf16 conv1d on
+      // cat([state, h]) with kernel=4.
+      uint16_t buf[4] = {st[1], st[2], st[3], h};
+      float32x4_t v_v = bf16x4_to_f32(buf);
+      float32x4_t v_w = bf16x4_to_f32(w);
+      float y = vaddvq_f32(vmulq_f32(v_v, v_w));
+      if (bias) y += bf16_to_f32_scalar(bias[c]);
+      // F.conv1d outputs bf16 (round + FTZ), F.silu upcasts to fp32, applies
+      // silu, rounds back to bf16 (no FTZ). Round-trip the post-conv value
+      // through bf16-with-FTZ to align numerics with mkldnn's bf16 conv1d.
+      y = bf16_to_f32_scalar(f32_to_bf16_scalar_ftz(y));
+      if (silu) y = silu_f32(y);
+      out[b * C + c] = f32_to_bf16_scalar(y);
+      // Roll state forward by one position.
+      st[0] = st[1];
+      st[1] = st[2];
+      st[2] = st[3];
+      st[3] = h;
+    }
+  }
+}
+
+EXPORT void standalone_causal_conv1d_update_bf16(
+    const uint16_t *hidden_in,
+    uint16_t *conv_state,
+    const uint16_t *weight,
+    const uint16_t *bias,            // valid pointer; ignored when has_bias==0
+    uint16_t *out,
+    int64_t B, int64_t C, int64_t kernel_size,
+    int64_t silu, int64_t has_bias) {
+  if (kernel_size != 4) return;
+  causal_conv1d_update_bf16_kn4(hidden_in, conv_state, weight,
+                                 has_bias ? bias : nullptr, out,
+                                 silu ? 1 : 0, B, C);
+}
+
 } // extern "C"
 
 #else
@@ -683,6 +784,10 @@ EXPORT void standalone_gated_delta_decode_fp32(
     const float *, const float *, const float *,
     const float *, const float *,
     float *, float *,
+    int64_t, int64_t, int64_t, int64_t, int64_t) {}
+EXPORT void standalone_causal_conv1d_update_bf16(
+    const uint16_t *, uint16_t *, const uint16_t *,
+    const uint16_t *, uint16_t *,
     int64_t, int64_t, int64_t, int64_t, int64_t) {}
 }
 #endif
