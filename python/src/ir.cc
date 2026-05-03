@@ -1600,6 +1600,13 @@ void init_triton_ir(py::module &&m) {
                  self.getBuilder().getF32FloatAttr(sm_scale),
                  num_heads, num_kv_heads, stride_kn, stride_vn);
            })
+      .def("create_cpu_rms_norm",
+           [](TritonOpBuilder &self, mlir::Value &x, mlir::Value &weight,
+              mlir::Value &out, mlir::Value &D, float eps) {
+             self.create<CpuRmsNormOp>(
+                 x, weight, out, D,
+                 self.getBuilder().getF32FloatAttr(eps));
+           })
       .def("create_cpu_swiglu",
            [](TritonOpBuilder &self, mlir::Value &gate, mlir::Value &up,
               mlir::Value &out, mlir::Value &N) {

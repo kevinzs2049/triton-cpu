@@ -108,6 +108,27 @@ def flash_attn_decode(q_ptr, k_ptr, v_ptr, out_ptr,
 
 
 @builtin
+def rms_norm(x_ptr, weight_ptr, out_ptr, D, eps, _builder=None):
+    """TLE-CPU: RMSNorm — out = (x / rms(x)) * weight.
+
+    Single NEON kernel replaces 5 ATen decomposed ops.
+    BF16 input/output, single-threaded (optimal for decode D <= 4096).
+
+    Args:
+        x_ptr: pointer to [D] bfloat16 input
+        weight_ptr: pointer to [D] bfloat16 weight
+        out_ptr: pointer to [D] bfloat16 output
+        D: hidden dimension
+        eps: epsilon for numerical stability
+    """
+    D_raw = _unwrap_if_constexpr(D)
+    D_val = D_raw.handle if hasattr(D_raw, 'handle') else _builder.get_int64(D_raw)
+    eps_f = float(_unwrap_if_constexpr(eps))
+    _builder.create_cpu_rms_norm(x_ptr.handle, weight_ptr.handle, out_ptr.handle, D_val, eps_f)
+    return None
+
+
+@builtin
 def swiglu(gate_ptr, up_ptr, out_ptr, N, _builder=None):
     """TLE-CPU: Fused SWIGLU activation: out = silu(gate) * up.
 

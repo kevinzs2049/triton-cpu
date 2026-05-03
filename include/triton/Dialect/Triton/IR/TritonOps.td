@@ -835,6 +835,16 @@ def TT_CpuFlashAttnDecodeOp : TT_Op<"cpu_flash_attn_decode", []> {
 }
 
 //
+// TLE-CPU: RMSNorm (out = x / rms(x) * weight)
+//
+def TT_CpuRmsNormOp : TT_Op<"cpu_rms_norm", []> {
+    let summary = "TLE-CPU: RMSNorm (x / rms(x) * weight)";
+    let arguments = (ins TT_Ptr:$x_ptr, TT_Ptr:$weight_ptr, TT_Ptr:$out_ptr, I64:$D, F32Attr:$eps);
+    let results = (outs);
+    let assemblyFormat = "$x_ptr `,` $weight_ptr `,` $out_ptr `,` $D attr-dict `:` type($x_ptr) `,` type($weight_ptr) `,` type($out_ptr)";
+}
+
+//
 // TLE-CPU: Fused SWIGLU (silu(gate) * up)
 //
 def TT_CpuSwigluOp : TT_Op<"cpu_swiglu", []> {

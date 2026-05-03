@@ -440,6 +440,42 @@ EXPORT void fused_transformer_decode_layer(
   std::memcpy(hidden_states, residual, hidden * 2);
 }
 
+/* ═══════════════════════════════════════════════════════════
+ * Standalone ops: RMSNorm, RoPE, residual add, KV cache write
+ * Exposed for Phase 1+ op-level optimization (no layer fusion).
+ * ═══════════════════════════════════════════════════════════ */
+
+EXPORT void standalone_rms_norm_bf16(
+    const uint16_t *x, const uint16_t *weight,
+    uint16_t *out, int64_t D, float eps) {
+  rms_norm_bf16(x, weight, out, D, eps);
+}
+
+EXPORT void standalone_rope_bf16(
+    uint16_t *q, uint16_t *k,
+    const uint16_t *cos_emb, const uint16_t *sin_emb,
+    int64_t n_heads, int64_t n_kv_heads, int64_t head_dim) {
+  apply_rope_bf16(q, k, cos_emb, sin_emb, n_heads, n_kv_heads, head_dim);
+}
+
+EXPORT void standalone_residual_add_bf16(
+    uint16_t *residual, const uint16_t *x, int64_t D) {
+  residual_add_bf16(residual, x, D);
+}
+
+EXPORT void standalone_kv_cache_write_bf16(
+    uint16_t *k_cache, uint16_t *v_cache,
+    const uint16_t *k_buf, const uint16_t *v_buf,
+    int64_t n_kv_heads, int64_t max_seq_len, int64_t head_dim,
+    int64_t cache_pos) {
+  for (int64_t h = 0; h < n_kv_heads; h++) {
+    std::memcpy(k_cache + h * max_seq_len * head_dim + cache_pos * head_dim,
+                k_buf + h * head_dim, head_dim * 2);
+    std::memcpy(v_cache + h * max_seq_len * head_dim + cache_pos * head_dim,
+                v_buf + h * head_dim, head_dim * 2);
+  }
+}
+
 } // extern "C"
 
 #else
@@ -454,5 +490,14 @@ EXPORT void fused_transformer_decode_layer(
     const float *, const float *, const float *,
     const uint16_t *, const uint16_t *,
     int64_t, int64_t, int64_t, int64_t, int64_t, float) {}
+EXPORT void standalone_rms_norm_bf16(
+    const uint16_t *, const uint16_t *, uint16_t *, int64_t, float) {}
+EXPORT void standalone_rope_bf16(
+    uint16_t *, uint16_t *, const uint16_t *, const uint16_t *,
+    int64_t, int64_t, int64_t) {}
+EXPORT void standalone_residual_add_bf16(uint16_t *, const uint16_t *, int64_t) {}
+EXPORT void standalone_kv_cache_write_bf16(
+    uint16_t *, uint16_t *, const uint16_t *, const uint16_t *,
+    int64_t, int64_t, int64_t, int64_t) {}
 }
 #endif
