@@ -514,6 +514,148 @@ EXPORT void standalone_kv_cache_write_bf16(
   }
 }
 
+/* ═══════════════════════════════════════════════════════════
+ * Gated Delta Net recurrent decode (T=1) — fp32, NEON.
+ *
+ * Per (b, h) head:
+ *   1. state *= exp(g)
+ *   2. kv_mem[v]  = sum_k state[k, v] * k_in[k]
+ *   3. delta[v]   = (v_in[v] - kv_mem[v]) * beta
+ *   4+5. fused:  state[k, v] += k_in[k] * delta[v]
+ *                out[v]      += state_post[k, v] * (q_in[k] * scale)
+ *
+ * State update + output dot fused into a single pass over state, matching
+ * llama.cpp Metal/SYCL backends (their CPU kernel does these as 2 passes).
+ * Saves ~one full state read+write per token.
+ *
+ * Optional in-kernel L2 norm of q & k (use_qk_l2norm_in_kernel=True path)
+ * to match torch_recurrent_gated_delta_rule.
+ *
+ * Constraints:
+ *   k_dim, v_dim multiples of 4, ≤ 256 (stack alloc cap).
+ * ═══════════════════════════════════════════════════════════ */
+
+static void gated_delta_decode_fp32(
+    const float *q,        // [B, H, k_dim]
+    const float *k,        // [B, H, k_dim]
+    const float *v,        // [B, H, v_dim]
+    const float *g,        // [B, H]   (raw, exp'd internally)
+    const float *beta,     // [B, H]
+    float *state,          // [B, H, k_dim, v_dim]   IN-OUT
+    float *out,            // [B, H, v_dim]          OUT
+    int64_t B, int64_t H,
+    int64_t k_dim, int64_t v_dim,
+    int use_l2norm) {
+  const float scale = 1.0f / sqrtf((float)k_dim);
+  const float l2_eps = 1e-6f;
+
+  #pragma omp parallel for collapse(2) schedule(static)
+  for (int64_t b = 0; b < B; b++) {
+    for (int64_t h = 0; h < H; h++) {
+      float *S = state + ((b * H + h) * k_dim) * v_dim;
+      const float *qh_in = q + (b * H + h) * k_dim;
+      const float *kh_in = k + (b * H + h) * k_dim;
+      const float *vh    = v + (b * H + h) * v_dim;
+      float g_exp  = expf(g[b * H + h]);
+      float beta_h = beta[b * H + h];
+
+      // Local q/k buffers (don't mutate caller tensors).
+      float qh[256], kh[256];
+      float kv_mem[256] = {0};
+      float delta[256];
+      float out_acc[256] = {0};
+
+      std::memcpy(qh, qh_in, k_dim * sizeof(float));
+      std::memcpy(kh, kh_in, k_dim * sizeof(float));
+
+      // L2 norm along head_dim (matches torch l2norm with eps=1e-6).
+      if (use_l2norm) {
+        float ssq_q = 0.0f, ssq_k = 0.0f;
+        for (int64_t kk = 0; kk < k_dim; kk++) {
+          ssq_q += qh[kk] * qh[kk];
+          ssq_k += kh[kk] * kh[kk];
+        }
+        float inv_q = 1.0f / sqrtf(ssq_q + l2_eps);
+        float inv_k = 1.0f / sqrtf(ssq_k + l2_eps);
+        for (int64_t kk = 0; kk < k_dim; kk++) {
+          qh[kk] *= inv_q;
+          kh[kk] *= inv_k;
+        }
+      }
+      // Pre-scale q by 1/sqrt(k_dim) once per head, baked into the fused step.
+      for (int64_t kk = 0; kk < k_dim; kk++) qh[kk] *= scale;
+
+      // Step 1: state *= exp(g)
+      const int64_t total = k_dim * v_dim;
+      {
+        float32x4_t vg = vdupq_n_f32(g_exp);
+        int64_t i = 0;
+        for (; i + 4 <= total; i += 4) {
+          vst1q_f32(S + i, vmulq_f32(vld1q_f32(S + i), vg));
+        }
+        for (; i < total; i++) S[i] *= g_exp;
+      }
+
+      // Step 2: kv_mem[v] = sum_k state[k, v] * k_in[k]
+      for (int64_t kk = 0; kk < k_dim; kk++) {
+        const float k_val = kh[kk];
+        const float *row = S + kk * v_dim;
+        int64_t vv = 0;
+        for (; vv + 4 <= v_dim; vv += 4) {
+          float32x4_t s = vld1q_f32(row + vv);
+          float32x4_t m = vld1q_f32(kv_mem + vv);
+          vst1q_f32(kv_mem + vv, vfmaq_n_f32(m, s, k_val));
+        }
+        for (; vv < v_dim; vv++) kv_mem[vv] += row[vv] * k_val;
+      }
+
+      // Step 3: delta[v] = (v_in[v] - kv_mem[v]) * beta_h
+      {
+        float32x4_t vb = vdupq_n_f32(beta_h);
+        int64_t vv = 0;
+        for (; vv + 4 <= v_dim; vv += 4) {
+          float32x4_t d = vsubq_f32(vld1q_f32(vh + vv), vld1q_f32(kv_mem + vv));
+          vst1q_f32(delta + vv, vmulq_f32(d, vb));
+        }
+        for (; vv < v_dim; vv++) delta[vv] = (vh[vv] - kv_mem[vv]) * beta_h;
+      }
+
+      // Step 4+5 fused: state[k,v] += k_in[k]*delta[v];  out[v] += state_post[k,v] * q_scaled[k]
+      for (int64_t kk = 0; kk < k_dim; kk++) {
+        const float k_val = kh[kk];
+        const float q_val = qh[kk];   // already × scale
+        float *row = S + kk * v_dim;
+        int64_t vv = 0;
+        for (; vv + 4 <= v_dim; vv += 4) {
+          float32x4_t s = vld1q_f32(row + vv);
+          float32x4_t d = vld1q_f32(delta + vv);
+          s = vfmaq_n_f32(s, d, k_val);              // state update
+          vst1q_f32(row + vv, s);
+          float32x4_t o = vld1q_f32(out_acc + vv);
+          vst1q_f32(out_acc + vv, vfmaq_n_f32(o, s, q_val));  // out accumulate (post-update)
+        }
+        for (; vv < v_dim; vv++) {
+          float s = row[vv] + k_val * delta[vv];
+          row[vv] = s;
+          out_acc[vv] += s * q_val;
+        }
+      }
+
+      std::memcpy(out + (b * H + h) * v_dim, out_acc, v_dim * sizeof(float));
+    }
+  }
+}
+
+EXPORT void standalone_gated_delta_decode_fp32(
+    const float *q, const float *k, const float *v,
+    const float *g, const float *beta,
+    float *state, float *out,
+    int64_t B, int64_t H, int64_t k_dim, int64_t v_dim,
+    int64_t use_l2norm) {
+  gated_delta_decode_fp32(q, k, v, g, beta, state, out, B, H, k_dim, v_dim,
+                          use_l2norm ? 1 : 0);
+}
+
 } // extern "C"
 
 #else
@@ -537,5 +679,10 @@ EXPORT void standalone_residual_add_bf16(uint16_t *, const uint16_t *, int64_t) 
 EXPORT void standalone_kv_cache_write_bf16(
     uint16_t *, uint16_t *, const uint16_t *, const uint16_t *,
     int64_t, int64_t, int64_t, int64_t) {}
+EXPORT void standalone_gated_delta_decode_fp32(
+    const float *, const float *, const float *,
+    const float *, const float *,
+    float *, float *,
+    int64_t, int64_t, int64_t, int64_t, int64_t) {}
 }
 #endif

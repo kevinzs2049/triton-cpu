@@ -894,6 +894,25 @@ def TT_CpuRmsNormOp : TT_Op<"cpu_rms_norm", []> {
 }
 
 //
+// TLE-CPU: Gated Delta Net recurrent decode (T=1, fp32)
+//
+def TT_CpuGatedDeltaDecodeOp : TT_Op<"cpu_gated_delta_decode", []> {
+    let summary = "TLE-CPU: Gated Delta Net recurrent decode (T=1, fp32)";
+    let description = [{
+      Per-(b, h): state *= exp(g); kv_mem = state·k; delta = (v - kv_mem)·beta;
+      state += k⊗delta; out = state·(q/√k_dim). State update + output dot fused
+      into a single sweep over state. Optional in-kernel L2 norm of q & k.
+    }];
+    let arguments = (ins TT_Ptr:$q_ptr, TT_Ptr:$k_ptr, TT_Ptr:$v_ptr,
+                         TT_Ptr:$g_ptr, TT_Ptr:$beta_ptr,
+                         TT_Ptr:$state_ptr, TT_Ptr:$out_ptr,
+                         I64:$B, I64:$H, I64:$k_dim, I64:$v_dim,
+                         I64:$use_l2norm);
+    let results = (outs);
+    let assemblyFormat = "$q_ptr `,` $k_ptr `,` $v_ptr `,` $g_ptr `,` $beta_ptr `,` $state_ptr `,` $out_ptr `,` $B `,` $H `,` $k_dim `,` $v_dim `,` $use_l2norm attr-dict `:` type($q_ptr) `,` type($k_ptr) `,` type($v_ptr) `,` type($g_ptr) `,` type($beta_ptr) `,` type($state_ptr) `,` type($out_ptr)";
+}
+
+//
 // TLE-CPU: Fused SWIGLU (silu(gate) * up)
 //
 def TT_CpuSwigluOp : TT_Op<"cpu_swiglu", []> {
