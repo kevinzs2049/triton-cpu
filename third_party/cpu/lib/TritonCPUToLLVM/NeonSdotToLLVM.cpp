@@ -315,6 +315,56 @@ struct RmsNormOpLowering : public OpRewritePattern<triton::CpuRmsNormOp> {
   }
 };
 
+// ---------- CpuGatedDeltaDecodeOp → runtime call ----------
+
+struct GatedDeltaDecodeOpLowering
+    : public OpRewritePattern<triton::CpuGatedDeltaDecodeOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(triton::CpuGatedDeltaDecodeOp op,
+                                PatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    auto ctx = rewriter.getContext();
+    auto module = op->getParentOfType<ModuleOp>();
+    auto i64Ty = IntegerType::get(ctx, 64);
+    auto ptrTy = LLVM::LLVMPointerType::get(ctx);
+
+    auto funcName = "standalone_gated_delta_decode_fp32";
+    auto funcOp = module.lookupSymbol<LLVM::LLVMFuncOp>(funcName);
+    if (!funcOp) {
+      auto voidTy = LLVM::LLVMVoidType::get(ctx);
+      // 7 ptrs + 5 i64
+      auto funcType = LLVM::LLVMFunctionType::get(
+          voidTy,
+          {ptrTy, ptrTy, ptrTy, ptrTy, ptrTy, ptrTy, ptrTy,
+           i64Ty, i64Ty, i64Ty, i64Ty, i64Ty},
+          false);
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(module.getBody());
+      funcOp = rewriter.create<LLVM::LLVMFuncOp>(
+          UnknownLoc::get(ctx), funcName, funcType);
+    }
+
+    auto castPtr = [&](Value v) -> Value {
+      if (isa<LLVM::LLVMPointerType>(v.getType())) return v;
+      return rewriter.create<UnrealizedConversionCastOp>(loc, ptrTy, v)
+          .getResult(0);
+    };
+
+    rewriter.create<LLVM::CallOp>(
+        loc, funcOp,
+        ValueRange{castPtr(op.getQPtr()), castPtr(op.getKPtr()),
+                   castPtr(op.getVPtr()), castPtr(op.getGPtr()),
+                   castPtr(op.getBetaPtr()), castPtr(op.getStatePtr()),
+                   castPtr(op.getOutPtr()),
+                   op.getB(), op.getH(),
+                   op.getKDim(), op.getVDim(),
+                   op.getUseL2norm()});
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
 // ---------- CpuSwigluOp → runtime call ----------
 
 struct SwigluOpLowering : public OpRewritePattern<triton::CpuSwigluOp> {
@@ -379,6 +429,7 @@ std::unique_ptr<Pass> createNeonSdotToLLVMPass() {
       patterns.add<SdotGemvFusedBf16OpLowering>(ctx);
       patterns.add<SdotPackWeightsOpLowering>(ctx);
       patterns.add<RmsNormOpLowering>(ctx);
+      patterns.add<GatedDeltaDecodeOpLowering>(ctx);
       patterns.add<SwigluOpLowering>(ctx);
       patterns.add<FlashAttnDecodeOpLowering>(ctx);
       patterns.add<FusedMlpOpLowering>(ctx);
