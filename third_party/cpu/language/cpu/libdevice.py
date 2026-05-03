@@ -220,3 +220,38 @@ def signbit(arg0, _builder=None, _generator=None):
     bitwidth = arg0.dtype.primitive_bitwidth
     uint_dtype = tl.core.get_int_dtype(bitwidth, signed=False)
     return _generator.call_JitFunction(_signbit, (arg0, uint_dtype), kwargs={})
+
+from triton.language.core import extern, dtype as tl_dtype
+from triton.language import core
+
+@core.extern
+def div_rn(arg0, arg1, _builder=None):
+    return core.extern_elementwise(
+        "", "", [arg0, arg1], {
+            (core.dtype("fp32"), core.dtype("fp32")): ("__nv_fdiv_rn", core.dtype("fp32")),
+            (core.dtype("fp64"), core.dtype("fp64")): ("__nv_ddiv_rn", core.dtype("fp64")),
+        }, is_pure=True, _builder=_builder)
+
+@core.extern
+def div_rz(arg0, arg1, _builder=None):
+    return core.extern_elementwise(
+        "", "", [arg0, arg1], {
+            (core.dtype("fp32"), core.dtype("fp32")): ("__nv_fdiv_rz", core.dtype("fp32")),
+            (core.dtype("fp64"), core.dtype("fp64")): ("__nv_ddiv_rz", core.dtype("fp64")),
+        }, is_pure=True, _builder=_builder)
+
+@core.extern
+def fmod(arg0, arg1, _builder=None):
+    return core.extern_elementwise(
+        "", "", [arg0, arg1], {
+            (core.dtype("fp32"), core.dtype("fp32")): ("__nv_fmodf", core.dtype("fp32")),
+            (core.dtype("fp64"), core.dtype("fp64")): ("__nv_fmod", core.dtype("fp64")),
+        }, is_pure=True, _builder=_builder)
+
+@core.extern
+def trunc(arg0, _builder=None):
+    return core.extern_elementwise(
+        "", "", [arg0], {
+            (core.dtype("fp32"),): ("__nv_truncf", core.dtype("fp32")),
+            (core.dtype("fp64"),): ("__nv_trunc", core.dtype("fp64")),
+        }, is_pure=True, _builder=_builder)
