@@ -847,6 +847,22 @@ def TT_CpuRmsNormOp : TT_Op<"cpu_rms_norm", []> {
 //
 // TLE-CPU: Gated Delta Net recurrent decode (T=1, fp32)
 //
+def TT_CpuCausalConv1dUpdateOp : TT_Op<"cpu_causal_conv1d_update", []> {
+    let summary = "TLE-CPU: Depthwise causal conv1d update (T=1, bf16, kernel_size=4)";
+    let description = [{
+      Per (b, c): out[b,c] = sum_k v[b,c,k] * weight[c,k] where v = [state[b,c,0..2], hidden[b,c]];
+      then roll state by 1. Optional bias and SiLU. Replaces aten::conv1d/mkldnn for the
+      decode-step conv state update on Qwen3.5/Qwen3-Next GDN.
+    }];
+    let arguments = (ins TT_Ptr:$hidden_ptr, TT_Ptr:$state_ptr,
+                         TT_Ptr:$weight_ptr, TT_Ptr:$bias_ptr,
+                         TT_Ptr:$out_ptr,
+                         I64:$B, I64:$C, I64:$kernel_size,
+                         I64:$silu, I64:$has_bias);
+    let results = (outs);
+    let assemblyFormat = "$hidden_ptr `,` $state_ptr `,` $weight_ptr `,` $bias_ptr `,` $out_ptr `,` $B `,` $C `,` $kernel_size `,` $silu `,` $has_bias attr-dict `:` type($hidden_ptr) `,` type($state_ptr) `,` type($weight_ptr) `,` type($bias_ptr) `,` type($out_ptr)";
+}
+
 def TT_CpuGatedDeltaDecodeOp : TT_Op<"cpu_gated_delta_decode", []> {
     let summary = "TLE-CPU: Gated Delta Net recurrent decode (T=1, fp32)";
     let description = [{

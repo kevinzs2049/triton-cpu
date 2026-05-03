@@ -1607,6 +1607,16 @@ void init_triton_ir(py::module &&m) {
                  x, weight, out, D,
                  self.getBuilder().getF32FloatAttr(eps));
            })
+      .def("create_cpu_causal_conv1d_update",
+           [](TritonOpBuilder &self, mlir::Value &hidden, mlir::Value &state,
+              mlir::Value &weight, mlir::Value &bias, mlir::Value &out,
+              mlir::Value &B, mlir::Value &C,
+              mlir::Value &kernel_size, mlir::Value &silu,
+              mlir::Value &has_bias) {
+             self.create<CpuCausalConv1dUpdateOp>(
+                 hidden, state, weight, bias, out, B, C, kernel_size,
+                 silu, has_bias);
+           })
       .def("create_cpu_gated_delta_decode",
            [](TritonOpBuilder &self, mlir::Value &q, mlir::Value &k,
               mlir::Value &v, mlir::Value &g, mlir::Value &beta,
