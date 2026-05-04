@@ -349,6 +349,30 @@ def sdot_gemv_fused_bf16(x_ptr, b_packed_ptr, w_scale_ptr, out_ptr, K, N, _build
 
 
 @builtin
+def sdot_gemv_w4a8_bf16(x_ptr, b_packed_ptr, w_scale_ptr, out_ptr, K, N, _builder=None):
+    """TLE-CPU: Fused W4A8 SDOT GEMV (per-channel symmetric W4, dynamic A8, bf16 in/out).
+
+    Decode-path GEMV using NEON SDOT with on-the-fly 4-bit weight unpack.
+
+    Args:
+        x_ptr: pointer to [K] bfloat16 activation
+        b_packed_ptr: pointer to packed int4 weights — layout
+                      [K/4, N/4, 4, 2] int8 (16 i4 weights / 8 bytes per block)
+        w_scale_ptr: pointer to [N] float32 per-channel scale
+        out_ptr: pointer to [N] bfloat16 output
+        K, N: dimensions (both must be divisible by 4)
+    """
+    K_raw = _unwrap_if_constexpr(K)
+    N_raw = _unwrap_if_constexpr(N)
+    K_val = K_raw.handle if hasattr(K_raw, 'handle') else _builder.get_int64(K_raw)
+    N_val = N_raw.handle if hasattr(N_raw, 'handle') else _builder.get_int64(N_raw)
+    _builder.create_cpu_sdot_gemv_w4a8_bf16(
+        x_ptr.handle, b_packed_ptr.handle, w_scale_ptr.handle,
+        out_ptr.handle, K_val, N_val)
+    return None
+
+
+@builtin
 def sdot_pack_weights(b_ptr, b_packed_ptr, K, N, _builder=None):
     """TLE-CPU: Pack INT8 weights from row-major [K,N] to SDOT format [K//4, N//4, 4, 4].
 

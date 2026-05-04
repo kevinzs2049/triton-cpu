@@ -912,6 +912,24 @@ def TT_CpuCausalConv1dUpdateOp : TT_Op<"cpu_causal_conv1d_update", []> {
     let assemblyFormat = "$hidden_ptr `,` $state_ptr `,` $weight_ptr `,` $bias_ptr `,` $out_ptr `,` $B `,` $C `,` $kernel_size `,` $silu `,` $has_bias attr-dict `:` type($hidden_ptr) `,` type($state_ptr) `,` type($weight_ptr) `,` type($bias_ptr) `,` type($out_ptr)";
 }
 
+//
+// TLE-CPU: W4A8 SDOT GEMV (per-channel symmetric W4, dynamic per-token A8, bf16 in/out)
+//
+def TT_CpuSdotGemvW4A8Bf16Op : TT_Op<"cpu_sdot_gemv_w4a8_bf16", []> {
+    let summary = "TLE-CPU: W4A8 SDOT GEMV with on-the-fly W4 unpack";
+    let description = [{
+      Decode-path GEMV using NEON SDOT with 4-bit packed weights.
+      x_ptr: [K] bf16; b_packed_ptr: [K/4, N/4, 4, 2] int8 (16 i4 weights / 8 bytes per block);
+      w_scale_ptr: [N] fp32; out_ptr: [N] bf16. Activation is dynamically int8-quantized
+      per-token inside the kernel.
+    }];
+    let arguments = (ins TT_Ptr:$x_ptr, TT_Ptr:$b_packed_ptr,
+                         TT_Ptr:$w_scale_ptr, TT_Ptr:$out_ptr,
+                         I64:$K, I64:$N);
+    let results = (outs);
+    let assemblyFormat = "$x_ptr `,` $b_packed_ptr `,` $w_scale_ptr `,` $out_ptr `,` $K `,` $N attr-dict `:` type($x_ptr) `,` type($b_packed_ptr) `,` type($w_scale_ptr) `,` type($out_ptr)";
+}
+
 def TT_CpuGatedDeltaDecodeOp : TT_Op<"cpu_gated_delta_decode", []> {
     let summary = "TLE-CPU: Gated Delta Net recurrent decode (T=1, fp32)";
     let description = [{

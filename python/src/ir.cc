@@ -1662,6 +1662,13 @@ void init_triton_ir(py::module &&m) {
                  hidden, state, weight, bias, out, B, C, kernel_size,
                  silu, has_bias);
            })
+      .def("create_cpu_sdot_gemv_w4a8_bf16",
+           [](TritonOpBuilder &self, mlir::Value &x_ptr,
+              mlir::Value &b_packed_ptr, mlir::Value &w_scale_ptr,
+              mlir::Value &out_ptr, mlir::Value &K, mlir::Value &N) {
+             self.create<CpuSdotGemvW4A8Bf16Op>(
+                 x_ptr, b_packed_ptr, w_scale_ptr, out_ptr, K, N);
+           })
       .def("create_cpu_gated_delta_decode",
            [](TritonOpBuilder &self, mlir::Value &q, mlir::Value &k,
               mlir::Value &v, mlir::Value &g, mlir::Value &beta,
