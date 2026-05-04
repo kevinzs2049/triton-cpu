@@ -316,6 +316,155 @@ EXPORT void sdot_gemv_m1_w4_fused_bf16(const uint16_t *x_bf16,
   }
 }
 
+/* ═══════════════════════════════════════════════════════════
+ * Q4_0-style W4A8 SDOT GEMV: per-block-32 W4 with fp16 scale per block per
+ * output channel. Mirrors llama.cpp Q4_0 quantization (1 fp16 scale per
+ * 32 K-elements per output channel).
+ *
+ * Layouts:
+ *   weights:      [K/4, N/4, 4, 2] int8           (16 i4 weights per (kb, nb) block, same as W4 per-channel)
+ *   block_scales: [K/32, N] fp16                   (1 scale per K-block-32 per output channel)
+ *   activation:   [K] bf16                         (dynamically int8-quantized in kernel)
+ *   out:          [N] bf16
+ *
+ * Per super-block of 32 K, accumulate 8 SDOTs into int32, then multiply by
+ * (block_scale × activation_scale) to fp32, accumulate fp32 across blocks,
+ * then convert to bf16. Avoids per-channel scale's outlier sensitivity.
+ *
+ * Constraint: K must be a multiple of 32 (and N a multiple of 4).
+ * ═══════════════════════════════════════════════════════════ */
+
+static void sdot_gemv_q4_0_range(const int8_t *A_int8, const int8_t *B_w4,
+                                  const uint16_t *block_scales_fp16,
+                                  float x_scale,
+                                  uint16_t *out_bf16,
+                                  int64_t K, int64_t N4,
+                                  int64_t nb_start, int64_t nb_count) {
+  // K must be multiple of 32 (caller guarantees).
+  const int64_t K_super = K / 32;
+
+  // Per-N-stripe accumulators. Two arrays:
+  //   int_acc[i]: int32 SDOT accumulator within the current K-block-32
+  //   out_fp[i]:  fp32 accumulator across K-blocks (after per-block dequant)
+  // Stack-allocate when small; fall back to heap for very large N (e.g.
+  // lm_head N=248320 → count_n4 up to 7760 per thread).
+  std::vector<int32x4_t> int_heap;
+  std::vector<float32x4_t> out_heap;
+  int32x4_t int_stack[1024];
+  float32x4_t out_stack[1024];
+  int32x4_t *int_acc;
+  float32x4_t *out_fp;
+  if (nb_count <= 1024) {
+    int_acc = int_stack;
+    out_fp = out_stack;
+  } else {
+    int_heap.resize(nb_count);
+    out_heap.resize(nb_count);
+    int_acc = int_heap.data();
+    out_fp = out_heap.data();
+  }
+  for (int64_t i = 0; i < nb_count; i++) out_fp[i] = vdupq_n_f32(0.0f);
+
+  for (int64_t kb_super = 0; kb_super < K_super; kb_super++) {
+    // Reset int32 accumulator at the start of each K-block-32.
+    for (int64_t i = 0; i < nb_count; i++) int_acc[i] = vdupq_n_s32(0);
+
+    // 8 K-stripes (kb = kb_super*8 .. kb_super*8+7) within this block.
+    const int8_t *xp = A_int8 + kb_super * 32;
+    for (int j = 0; j < 8; j++) {
+      int32_t a4;
+      std::memcpy(&a4, xp + j * 4, 4);
+      int8x16_t av = vreinterpretq_s8_s32(vdupq_n_s32(a4));
+
+      // Inner loop: iterate N-stripes sequentially (cache-friendly).
+      // Weight ptr: stripe (kb=kb_super*8+j, nb) is at offset
+      //   (kb*N4 + nb) * 8 bytes.
+      const int8_t *bp = B_w4 + (((kb_super * 8 + j) * N4 + nb_start) * 8);
+
+      int64_t i = 0;
+      for (; i + 4 <= nb_count; i += 4) {
+        // 4-way unroll for ILP
+        int8x8_t p0 = vld1_s8(bp);     bp += 8;
+        int8x8_t p1 = vld1_s8(bp);     bp += 8;
+        int8x8_t p2 = vld1_s8(bp);     bp += 8;
+        int8x8_t p3 = vld1_s8(bp);     bp += 8;
+        int8x8_t lo0 = vshr_n_s8(vshl_n_s8(p0, 4), 4);
+        int8x8_t lo1 = vshr_n_s8(vshl_n_s8(p1, 4), 4);
+        int8x8_t lo2 = vshr_n_s8(vshl_n_s8(p2, 4), 4);
+        int8x8_t lo3 = vshr_n_s8(vshl_n_s8(p3, 4), 4);
+        int8x8_t hi0 = vshr_n_s8(p0, 4);
+        int8x8_t hi1 = vshr_n_s8(p1, 4);
+        int8x8_t hi2 = vshr_n_s8(p2, 4);
+        int8x8_t hi3 = vshr_n_s8(p3, 4);
+        int8x16_t b0 = vzip1q_s8(vcombine_s8(lo0, vdup_n_s8(0)), vcombine_s8(hi0, vdup_n_s8(0)));
+        int8x16_t b1 = vzip1q_s8(vcombine_s8(lo1, vdup_n_s8(0)), vcombine_s8(hi1, vdup_n_s8(0)));
+        int8x16_t b2 = vzip1q_s8(vcombine_s8(lo2, vdup_n_s8(0)), vcombine_s8(hi2, vdup_n_s8(0)));
+        int8x16_t b3 = vzip1q_s8(vcombine_s8(lo3, vdup_n_s8(0)), vcombine_s8(hi3, vdup_n_s8(0)));
+        int_acc[i]   = vdotq_s32(int_acc[i],   av, b0);
+        int_acc[i+1] = vdotq_s32(int_acc[i+1], av, b1);
+        int_acc[i+2] = vdotq_s32(int_acc[i+2], av, b2);
+        int_acc[i+3] = vdotq_s32(int_acc[i+3], av, b3);
+      }
+      for (; i < nb_count; i++) {
+        int8x8_t p = vld1_s8(bp);
+        int8x8_t lo = vshr_n_s8(vshl_n_s8(p, 4), 4);
+        int8x8_t hi = vshr_n_s8(p, 4);
+        int8x16_t bv = vzip1q_s8(vcombine_s8(lo, vdup_n_s8(0)),
+                                  vcombine_s8(hi, vdup_n_s8(0)));
+        int_acc[i] = vdotq_s32(int_acc[i], av, bv);
+        bp += 8;
+      }
+    }
+
+    // After this K-block-32: convert int32 → fp32, multiply by per-channel
+    // per-block scale, accumulate into out_fp[i].
+    const uint16_t *sp = block_scales_fp16 + kb_super * (N4 * 4) + nb_start * 4;
+    for (int64_t i = 0; i < nb_count; i++) {
+      float16x4_t scales_h = vld1_f16(reinterpret_cast<const float16_t *>(sp));
+      sp += 4;
+      float32x4_t scales = vcvt_f32_f16(scales_h);
+      out_fp[i] = vfmaq_f32(out_fp[i], vcvtq_f32_s32(int_acc[i]), scales);
+    }
+  }
+
+  // Final: multiply by per-token activation scale, convert fp32 → bf16.
+  float32x4_t xs = vdupq_n_f32(x_scale);
+  for (int64_t i = 0; i < nb_count; i++) {
+    float32x4_t out = vmulq_f32(out_fp[i], xs);
+    uint32x4_t ru = vreinterpretq_u32_f32(out);
+    uint16x4_t bf = vshrn_n_u32(ru, 16);
+    vst1_u16(out_bf16 + (nb_start + i) * 4, bf);
+  }
+}
+
+EXPORT void sdot_gemv_m1_q4_0_fused_bf16(const uint16_t *x_bf16,
+                                          const int8_t *B_w4,
+                                          const uint16_t *block_scales_fp16,
+                                          uint16_t *out_bf16,
+                                          int64_t K, int64_t N) {
+  // Quantize activation
+  int8_t x_int8[16384];
+  float x_scale = quantize_activation_bf16(x_bf16, x_int8, K);
+
+  int64_t N4 = N / 4;
+
+  #pragma omp parallel
+  {
+    int nt = omp_get_num_threads();
+    int tid = omp_get_thread_num();
+    int64_t chunk_n4 = (N4 + nt - 1) / nt;
+    int64_t start_n4 = tid * chunk_n4;
+    int64_t count_n4 = chunk_n4;
+    if (start_n4 + count_n4 > N4) count_n4 = N4 - start_n4;
+    if (start_n4 >= N4) count_n4 = 0;
+    if (count_n4 > 0) {
+      sdot_gemv_q4_0_range(x_int8, B_w4, block_scales_fp16,
+                            x_scale, out_bf16, K, N4,
+                            start_n4, count_n4);
+    }
+  }
+}
+
 /* W4 weight packer: [K, N] int8 (values in -7..7) → [K/4, N/4, 4, 2] int8. */
 EXPORT void sdot_pack_weights_w4(const int8_t *B, int8_t *B_packed,
                                   int64_t K, int64_t N) {
@@ -352,6 +501,9 @@ EXPORT void sdot_gemv_m1_w4_fused_bf16(const uint16_t *, const int8_t *,
                                         const float *, uint16_t *,
                                         int64_t, int64_t) {}
 EXPORT void sdot_pack_weights_w4(const int8_t *, int8_t *, int64_t, int64_t) {}
+EXPORT void sdot_gemv_m1_q4_0_fused_bf16(const uint16_t *, const int8_t *,
+                                          const uint16_t *, uint16_t *,
+                                          int64_t, int64_t) {}
 #endif
 
 } // extern "C"

@@ -915,6 +915,25 @@ def TT_CpuCausalConv1dUpdateOp : TT_Op<"cpu_causal_conv1d_update", []> {
 //
 // TLE-CPU: W4A8 SDOT GEMV (per-channel symmetric W4, dynamic per-token A8, bf16 in/out)
 //
+//
+// TLE-CPU: Q4_0-style W4A8 SDOT GEMV (per-block-32 W4 with fp16 scale per
+// block per output channel; per-token A8). Mirrors llama.cpp Q4_0 layout
+// for accuracy on outlier-heavy weights.
+//
+def TT_CpuSdotGemvQ40Bf16Op : TT_Op<"cpu_sdot_gemv_q4_0_bf16", []> {
+    let summary = "TLE-CPU: Q4_0-style W4A8 SDOT GEMV (per-block-32 fp16 scale)";
+    let description = [{
+      x_ptr: [K] bf16; b_packed_ptr: [K/4, N/4, 4, 2] int8 (16 i4 weights / 8 bytes per (kb, nb) block);
+      block_scales_ptr: [K/32, N] fp16 (one fp16 scale per K-block-32 per output channel);
+      out_ptr: [N] bf16. K must be a multiple of 32, N a multiple of 4.
+    }];
+    let arguments = (ins TT_Ptr:$x_ptr, TT_Ptr:$b_packed_ptr,
+                         TT_Ptr:$block_scales_ptr, TT_Ptr:$out_ptr,
+                         I64:$K, I64:$N);
+    let results = (outs);
+    let assemblyFormat = "$x_ptr `,` $b_packed_ptr `,` $block_scales_ptr `,` $out_ptr `,` $K `,` $N attr-dict `:` type($x_ptr) `,` type($b_packed_ptr) `,` type($block_scales_ptr) `,` type($out_ptr)";
+}
+
 def TT_CpuSdotGemvW4A8Bf16Op : TT_Op<"cpu_sdot_gemv_w4a8_bf16", []> {
     let summary = "TLE-CPU: W4A8 SDOT GEMV with on-the-fly W4 unpack";
     let description = [{

@@ -349,6 +349,32 @@ def sdot_gemv_fused_bf16(x_ptr, b_packed_ptr, w_scale_ptr, out_ptr, K, N, _build
 
 
 @builtin
+def sdot_gemv_q4_0_bf16(x_ptr, b_packed_ptr, block_scales_ptr, out_ptr, K, N, _builder=None):
+    """TLE-CPU: Q4_0-style W4A8 SDOT GEMV (per-block-32 fp16 scale, per-token A8, bf16 in/out).
+
+    Mirrors llama.cpp Q4_0 quantization layout (1 fp16 scale per 32 K-elements
+    per output channel) to handle outlier-heavy weight rows that per-channel
+    W4 can't represent.
+
+    Args:
+        x_ptr: pointer to [K] bfloat16 activation
+        b_packed_ptr: pointer to packed int4 weights, layout
+                       [K/4, N/4, 4, 2] int8 (16 i4 weights per (kb, nb) block)
+        block_scales_ptr: pointer to [K/32, N] float16 per-block-32 scale
+        out_ptr: pointer to [N] bfloat16 output
+        K, N: dimensions; K must be multiple of 32, N multiple of 4.
+    """
+    K_raw = _unwrap_if_constexpr(K)
+    N_raw = _unwrap_if_constexpr(N)
+    K_val = K_raw.handle if hasattr(K_raw, 'handle') else _builder.get_int64(K_raw)
+    N_val = N_raw.handle if hasattr(N_raw, 'handle') else _builder.get_int64(N_raw)
+    _builder.create_cpu_sdot_gemv_q4_0_bf16(
+        x_ptr.handle, b_packed_ptr.handle, block_scales_ptr.handle,
+        out_ptr.handle, K_val, N_val)
+    return None
+
+
+@builtin
 def sdot_gemv_w4a8_bf16(x_ptr, b_packed_ptr, w_scale_ptr, out_ptr, K, N, _builder=None):
     """TLE-CPU: Fused W4A8 SDOT GEMV (per-channel symmetric W4, dynamic A8, bf16 in/out).
 
