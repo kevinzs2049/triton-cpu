@@ -1662,6 +1662,13 @@ void init_triton_ir(py::module &&m) {
                  hidden, state, weight, bias, out, B, C, kernel_size,
                  silu, has_bias);
            })
+      .def("create_cpu_sdot_gemv_q4_0_v2_bf16",
+           [](TritonOpBuilder &self, mlir::Value &x_ptr,
+              mlir::Value &w_packed_ptr, mlir::Value &out_ptr,
+              mlir::Value &K, mlir::Value &N) {
+             self.create<CpuSdotGemvQ40V2Bf16Op>(
+                 x_ptr, w_packed_ptr, out_ptr, K, N);
+           })
       .def("create_cpu_sdot_gemv_q4_0_bf16",
            [](TritonOpBuilder &self, mlir::Value &x_ptr,
               mlir::Value &b_packed_ptr, mlir::Value &block_scales_ptr,

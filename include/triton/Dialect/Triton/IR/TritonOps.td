@@ -920,6 +920,24 @@ def TT_CpuCausalConv1dUpdateOp : TT_Op<"cpu_causal_conv1d_update", []> {
 // block per output channel; per-token A8). Mirrors llama.cpp Q4_0 layout
 // for accuracy on outlier-heavy weights.
 //
+//
+// TLE-CPU: Q4_0 v2 SDOT GEMV (llama.cpp-style layout — K-major per N row,
+// 16 bytes nibbles + 2 bytes fp16 scale per (N, K_block_32))
+//
+def TT_CpuSdotGemvQ40V2Bf16Op : TT_Op<"cpu_sdot_gemv_q4_0_v2_bf16", []> {
+    let summary = "TLE-CPU: Q4_0 v2 SDOT GEMV (llama.cpp-style per-N K-major layout)";
+    let description = [{
+      x_ptr: [K] bf16; w_packed_ptr: [N × K/32 × 18] int8 (16 bytes nibbles + 2 bytes
+      fp16 scale per K-block-32 per output channel); out_ptr: [N] bf16. K must be
+      a multiple of 32. Activation is dynamically int8-quantized per-token inside
+      the kernel.
+    }];
+    let arguments = (ins TT_Ptr:$x_ptr, TT_Ptr:$w_packed_ptr,
+                         TT_Ptr:$out_ptr, I64:$K, I64:$N);
+    let results = (outs);
+    let assemblyFormat = "$x_ptr `,` $w_packed_ptr `,` $out_ptr `,` $K `,` $N attr-dict `:` type($x_ptr) `,` type($w_packed_ptr) `,` type($out_ptr)";
+}
+
 def TT_CpuSdotGemvQ40Bf16Op : TT_Op<"cpu_sdot_gemv_q4_0_bf16", []> {
     let summary = "TLE-CPU: Q4_0-style W4A8 SDOT GEMV (per-block-32 fp16 scale)";
     let description = [{

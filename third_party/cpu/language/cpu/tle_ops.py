@@ -349,6 +349,29 @@ def sdot_gemv_fused_bf16(x_ptr, b_packed_ptr, w_scale_ptr, out_ptr, K, N, _build
 
 
 @builtin
+def sdot_gemv_q4_0_v2_bf16(x_ptr, w_packed_ptr, out_ptr, K, N, _builder=None):
+    """TLE-CPU: Q4_0 v2 SDOT GEMV (llama.cpp-style per-N K-major layout, bf16 in/out).
+
+    Single packed buffer of [N × K/32 × 18] bytes (16 bytes nibbles + 2 bytes
+    fp16 scale per K-block-32 per output channel). Per-token int8 activation
+    quant is computed inside the kernel.
+
+    Args:
+        x_ptr: pointer to [K] bfloat16 activation
+        w_packed_ptr: pointer to packed weight, [N × K/32 × 18] int8
+        out_ptr: pointer to [N] bfloat16 output
+        K, N: dimensions; K must be a multiple of 32.
+    """
+    K_raw = _unwrap_if_constexpr(K)
+    N_raw = _unwrap_if_constexpr(N)
+    K_val = K_raw.handle if hasattr(K_raw, 'handle') else _builder.get_int64(K_raw)
+    N_val = N_raw.handle if hasattr(N_raw, 'handle') else _builder.get_int64(N_raw)
+    _builder.create_cpu_sdot_gemv_q4_0_v2_bf16(
+        x_ptr.handle, w_packed_ptr.handle, out_ptr.handle, K_val, N_val)
+    return None
+
+
+@builtin
 def sdot_gemv_q4_0_bf16(x_ptr, b_packed_ptr, block_scales_ptr, out_ptr, K, N, _builder=None):
     """TLE-CPU: Q4_0-style W4A8 SDOT GEMV (per-block-32 fp16 scale, per-token A8, bf16 in/out).
 
