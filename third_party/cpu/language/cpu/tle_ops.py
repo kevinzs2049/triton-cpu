@@ -349,6 +349,28 @@ def sdot_gemv_fused_bf16(x_ptr, b_packed_ptr, w_scale_ptr, out_ptr, K, N, _build
 
 
 @builtin
+def gemm_q4_0_v2_smmla_bf16(x_ptr, w_packed_ptr, out_ptr, M, K, N, _builder=None):
+    """TLE-CPU: Q4_0 v2 SMMLA i8mm prefill GEMM (M >= 2).
+
+    Pairs M and N into 2x2 SMMLA tiles, on-the-fly Q4_0 unpack inside the
+    kernel. Per-token int8 activation quant computed inside.
+
+    Args:
+        x_ptr: pointer to [M, K] bfloat16 activation
+        w_packed_ptr: pointer to packed Q4_0 v2 weights, [N × K/32 × 18] int8
+        out_ptr: pointer to [M, N] bfloat16 output
+        M, K, N: dimensions; K must be a multiple of 32, N a multiple of 2.
+    """
+    def _i64(x):
+        raw = _unwrap_if_constexpr(x)
+        return raw.handle if hasattr(raw, 'handle') else _builder.get_int64(raw)
+    _builder.create_cpu_gemm_q4_0_v2_smmla_bf16(
+        x_ptr.handle, w_packed_ptr.handle, out_ptr.handle,
+        _i64(M), _i64(K), _i64(N))
+    return None
+
+
+@builtin
 def sdot_gemv_q4_0_v2_bf16(x_ptr, w_packed_ptr, out_ptr, K, N, _builder=None):
     """TLE-CPU: Q4_0 v2 SDOT GEMV (llama.cpp-style per-N K-major layout, bf16 in/out).
 

@@ -300,6 +300,48 @@ struct SdotGemvFusedBf16OpLowering
   }
 };
 
+// ---------- CpuGemmQ40V2SmmlaBf16Op → runtime call ----------
+
+struct GemmQ40V2SmmlaBf16OpLowering
+    : public OpRewritePattern<triton::CpuGemmQ40V2SmmlaBf16Op> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(triton::CpuGemmQ40V2SmmlaBf16Op op,
+                                PatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    auto ctx = rewriter.getContext();
+    auto module = op->getParentOfType<ModuleOp>();
+    auto i64Ty = IntegerType::get(ctx, 64);
+    auto ptrTy = LLVM::LLVMPointerType::get(ctx);
+
+    auto funcName = "sdot_gemm_q4_0_v2_smmla_bf16";
+    auto funcOp = module.lookupSymbol<LLVM::LLVMFuncOp>(funcName);
+    if (!funcOp) {
+      auto voidTy = LLVM::LLVMVoidType::get(ctx);
+      auto funcType = LLVM::LLVMFunctionType::get(
+          voidTy, {ptrTy, ptrTy, ptrTy, i64Ty, i64Ty, i64Ty}, false);
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(module.getBody());
+      funcOp = rewriter.create<LLVM::LLVMFuncOp>(
+          UnknownLoc::get(ctx), funcName, funcType);
+    }
+
+    auto castPtr = [&](Value v) -> Value {
+      if (isa<LLVM::LLVMPointerType>(v.getType())) return v;
+      return rewriter.create<UnrealizedConversionCastOp>(loc, ptrTy, v)
+          .getResult(0);
+    };
+
+    rewriter.create<LLVM::CallOp>(
+        loc, funcOp,
+        ValueRange{castPtr(op.getXPtr()), castPtr(op.getWPackedPtr()),
+                   castPtr(op.getOutPtr()),
+                   op.getM(), op.getK(), op.getN()});
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
 // ---------- CpuSdotGemvQ40V2Bf16Op → runtime call ----------
 
 struct SdotGemvQ40V2Bf16OpLowering
@@ -783,6 +825,7 @@ std::unique_ptr<Pass> createNeonSdotToLLVMPass() {
       patterns.add<SdotGemvW4A8Bf16OpLowering>(ctx);
       patterns.add<SdotGemvQ40Bf16OpLowering>(ctx);
       patterns.add<SdotGemvQ40V2Bf16OpLowering>(ctx);
+      patterns.add<GemmQ40V2SmmlaBf16OpLowering>(ctx);
       patterns.add<SdotPackWeightsOpLowering>(ctx);
       patterns.add<RmsNormOpLowering>(ctx);
       patterns.add<GatedDeltaDecodeOpLowering>(ctx);

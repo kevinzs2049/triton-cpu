@@ -578,6 +578,147 @@ EXPORT void sdot_gemv_m1_q4_0_v2_fused_bf16(
   }
 }
 
+/* ═══════════════════════════════════════════════════════════
+ * Q4_0 v2 SMMLA prefill GEMM (M >= 2). Uses NEON i8mm SMMLA
+ * (vmmlaq_s32) which does a 2x8 × 8x2 int8 matmul → 2x2 int32 in one
+ * instruction. Pairs M tokens into groups of 2 and N output channels
+ * into groups of 2, so one SMMLA computes 4 partial outputs.
+ *
+ * Inner per-(M-pair, N-pair, K-block-32):
+ *   load 16 packed bytes for n0's K-block + fp16 scale
+ *   load 16 packed bytes for n1's K-block + fp16 scale
+ *   unpack to 4 int8x16: lo0/hi0/lo1/hi1 (each = 16 K-elements for one N row)
+ *   load activation: 4 int8x16 for (m0/m1) × (lo/hi K-halves)
+ *   4 SMMLA instructions, accumulating int32 within this K-block
+ *   dequant: int_acc[lanes] × (w_scale * x_scale) → fp32 accumulators
+ * After all K-blocks: write 4 bf16 outputs.
+ *
+ * For odd M, the last row falls back to M=1 sdot_gemv_m1_q4_0_v2_fused_bf16.
+ * ═══════════════════════════════════════════════════════════ */
+
+EXPORT void sdot_gemm_q4_0_v2_smmla_bf16(
+    const uint16_t *x_bf16,   // [M, K] bf16 activation, M outer
+    const int8_t   *W_packed, // [N × K/32 × 18 bytes] int8 (Q4_0 v2 layout)
+    uint16_t       *out_bf16, // [M, N] bf16 output
+    int64_t M, int64_t K, int64_t N) {
+  if (M < 2) return;  // caller falls back for M=1
+  const int64_t K_blocks = K / 32;
+  const int64_t row_bytes = K_blocks * 18;
+
+  // Quantize all M activation rows to int8 with per-row fp32 scale.
+  // Buffer x_int8 [M, K], scales [M].
+  std::vector<int8_t> x_int8_buf(M * K);
+  std::vector<float>  x_scales(M);
+  for (int64_t m = 0; m < M; m++) {
+    x_scales[m] = quantize_activation_bf16(x_bf16 + m * K,
+                                            x_int8_buf.data() + m * K, K);
+  }
+
+  const int8x16_t s8b = vdupq_n_s8(8);
+  const uint8x16_t m4b = vdupq_n_u8(0x0F);
+
+  // Process rows in pairs (m0, m1=m0+1). If M is odd the last row is
+  // handled afterwards via the M=1 path on a per-N basis (keep simple here:
+  // assume caller pads or we handle leftover at end).
+  const int64_t M_pairs = M / 2;
+  const int64_t M_left  = M % 2;
+
+  // Parallel over N-pairs (each thread handles a chunk of n0=0,2,4,...)
+  #pragma omp parallel for schedule(static)
+  for (int64_t np = 0; np < N / 2; np++) {
+    int64_t n0 = np * 2;
+    int64_t n1 = n0 + 1;
+
+    // Iterate M pairs
+    for (int64_t mp = 0; mp < M_pairs; mp++) {
+      int64_t m0 = mp * 2;
+      int64_t m1 = m0 + 1;
+      float xs0 = x_scales[m0];
+      float xs1 = x_scales[m1];
+
+      // 2x2 fp32 accumulator (m0n0, m0n1, m1n0, m1n1)
+      float32x4_t fp_acc = vdupq_n_f32(0.0f);
+
+      for (int64_t kb = 0; kb < K_blocks; kb++) {
+        // Load weight bytes + scales for n0, n1 at this K-block
+        const int8_t *wp0 = W_packed + n0 * row_bytes + kb * 18;
+        const int8_t *wp1 = W_packed + n1 * row_bytes + kb * 18;
+        uint8x16_t w0 = vld1q_u8(reinterpret_cast<const uint8_t *>(wp0));
+        uint8x16_t w1 = vld1q_u8(reinterpret_cast<const uint8_t *>(wp1));
+        uint16_t s0_h, s1_h;
+        std::memcpy(&s0_h, wp0 + 16, 2);
+        std::memcpy(&s1_h, wp1 + 16, 2);
+        __fp16 h0, h1;
+        std::memcpy(&h0, &s0_h, 2);
+        std::memcpy(&h1, &s1_h, 2);
+        float ws0 = (float)h0;
+        float ws1 = (float)h1;
+
+        int8x16_t lo0 = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(w0, m4b)), s8b);
+        int8x16_t hi0 = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(w0, 4)), s8b);
+        int8x16_t lo1 = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(w1, m4b)), s8b);
+        int8x16_t hi1 = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(w1, 4)), s8b);
+
+        const int8_t *xp0 = x_int8_buf.data() + m0 * K + kb * 32;
+        const int8_t *xp1 = x_int8_buf.data() + m1 * K + kb * 32;
+        int8x16_t a0_lo = vld1q_s8(xp0);       // m0 K=0..15
+        int8x16_t a0_hi = vld1q_s8(xp0 + 16);  // m0 K=16..31
+        int8x16_t a1_lo = vld1q_s8(xp1);
+        int8x16_t a1_hi = vld1q_s8(xp1 + 16);
+
+        // SMMLA: 4 calls, each consuming 8 K-elements (lo halves of a/lo,
+        // hi halves of a/lo, lo halves of a/hi, hi halves of a/hi).
+        int32x4_t int_acc = vdupq_n_s32(0);
+        // K=0..7 (lo half of K=0..15 block)
+        int_acc = vmmlaq_s32(int_acc,
+            vcombine_s8(vget_low_s8(a0_lo), vget_low_s8(a1_lo)),
+            vcombine_s8(vget_low_s8(lo0),   vget_low_s8(lo1)));
+        // K=8..15 (high half of K=0..15 block)
+        int_acc = vmmlaq_s32(int_acc,
+            vcombine_s8(vget_high_s8(a0_lo), vget_high_s8(a1_lo)),
+            vcombine_s8(vget_high_s8(lo0),   vget_high_s8(lo1)));
+        // K=16..23 (lo half of K=16..31 block)
+        int_acc = vmmlaq_s32(int_acc,
+            vcombine_s8(vget_low_s8(a0_hi), vget_low_s8(a1_hi)),
+            vcombine_s8(vget_low_s8(hi0),   vget_low_s8(hi1)));
+        // K=24..31 (high half of K=16..31 block)
+        int_acc = vmmlaq_s32(int_acc,
+            vcombine_s8(vget_high_s8(a0_hi), vget_high_s8(a1_hi)),
+            vcombine_s8(vget_high_s8(hi0),   vget_high_s8(hi1)));
+
+        // Dequant: int_acc lanes are (m0n0, m0n1, m1n0, m1n1).
+        // Build per-block float scale per lane: lane i scale = w_scale[n] * x_scale[m].
+        float lane_scales_arr[4] = {
+            ws0 * xs0,  // m0n0
+            ws1 * xs0,  // m0n1
+            ws0 * xs1,  // m1n0
+            ws1 * xs1,  // m1n1
+        };
+        float32x4_t lane_scales = vld1q_f32(lane_scales_arr);
+        fp_acc = vfmaq_f32(fp_acc, vcvtq_f32_s32(int_acc), lane_scales);
+      }
+
+      // Write 4 bf16 outputs at out[m0, n0..n1] and out[m1, n0..n1].
+      uint32_t bits[4];
+      float vals[4];
+      vst1q_f32(vals, fp_acc);
+      for (int i = 0; i < 4; i++) std::memcpy(&bits[i], &vals[i], 4);
+      out_bf16[m0 * N + n0] = (uint16_t)(bits[0] >> 16);
+      out_bf16[m0 * N + n1] = (uint16_t)(bits[1] >> 16);
+      out_bf16[m1 * N + n0] = (uint16_t)(bits[2] >> 16);
+      out_bf16[m1 * N + n1] = (uint16_t)(bits[3] >> 16);
+    }
+  }
+
+  // Handle leftover M row (if M is odd). Use the M=1 GEMV per remaining row.
+  if (M_left) {
+    int64_t m_last = M - 1;
+    sdot_gemv_m1_q4_0_v2_fused_bf16(
+        x_bf16 + m_last * K, W_packed,
+        out_bf16 + m_last * N, K, N);
+  }
+}
+
 /* Pack a row-major [N, K] int8 weight (already quantized to Q4_0 nibbles in
  * [0..15], with subtract-8 decoding) plus per-(N, K_block_32) fp16 scales,
  * into the v2 layout [N × K/32 × 18 bytes]. Used by the Python pack helper
@@ -650,6 +791,8 @@ EXPORT void sdot_gemv_m1_q4_0_v2_fused_bf16(const uint16_t *, const int8_t *,
                                              uint16_t *, int64_t, int64_t) {}
 EXPORT void sdot_pack_weights_q4_0_v2(const int8_t *, const uint16_t *,
                                        int8_t *, int64_t, int64_t) {}
+EXPORT void sdot_gemm_q4_0_v2_smmla_bf16(const uint16_t *, const int8_t *,
+                                          uint16_t *, int64_t, int64_t, int64_t) {}
 #endif
 
 } // extern "C"

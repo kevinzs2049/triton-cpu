@@ -924,6 +924,18 @@ def TT_CpuCausalConv1dUpdateOp : TT_Op<"cpu_causal_conv1d_update", []> {
 // TLE-CPU: Q4_0 v2 SDOT GEMV (llama.cpp-style layout — K-major per N row,
 // 16 bytes nibbles + 2 bytes fp16 scale per (N, K_block_32))
 //
+//
+// TLE-CPU: Q4_0 v2 SMMLA prefill GEMM (M >= 2). Pairs M and N into 2x2
+// SMMLA tiles, on-the-fly Q4_0 unpack.
+//
+def TT_CpuGemmQ40V2SmmlaBf16Op : TT_Op<"cpu_gemm_q4_0_v2_smmla_bf16", []> {
+    let summary = "TLE-CPU: Q4_0 v2 SMMLA i8mm prefill GEMM";
+    let arguments = (ins TT_Ptr:$x_ptr, TT_Ptr:$w_packed_ptr,
+                         TT_Ptr:$out_ptr, I64:$M, I64:$K, I64:$N);
+    let results = (outs);
+    let assemblyFormat = "$x_ptr `,` $w_packed_ptr `,` $out_ptr `,` $M `,` $K `,` $N attr-dict `:` type($x_ptr) `,` type($w_packed_ptr) `,` type($out_ptr)";
+}
+
 def TT_CpuSdotGemvQ40V2Bf16Op : TT_Op<"cpu_sdot_gemv_q4_0_v2_bf16", []> {
     let summary = "TLE-CPU: Q4_0 v2 SDOT GEMV (llama.cpp-style per-N K-major layout)";
     let description = [{
