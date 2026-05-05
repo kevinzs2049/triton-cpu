@@ -518,7 +518,7 @@ EXPORT void sdot_gemv_m1_q4_0_fused_bf16(const uint16_t *x_bf16,
 
 EXPORT void sdot_gemv_m1_q4_0_v2_fused_bf16(
     const uint16_t *x_bf16,             // [K] bf16 activation
-    const int8_t   *W_packed,           // [N × K/32 × 18] int8 (per-N, per-K-block: 16 bytes nibbles + 2 bytes fp16 scale)
+    const int8_t   *W_packed,           // [N × K/32 × 18] int8 — pack format is **kxor** (data bytes XOR'd with 0x88)
     uint16_t       *out_bf16,           // [N] bf16 output
     int64_t K, int64_t N) {
   // Quantize activation once (per-token int8).
@@ -527,50 +527,40 @@ EXPORT void sdot_gemv_m1_q4_0_v2_fused_bf16(
 
   const int64_t K_blocks = K / 32;
   const int64_t row_bytes = K_blocks * 18;
-
-  const int8x16_t s8b = vdupq_n_s8(8);
-  const uint8x16_t m4b = vdupq_n_u8(0x0F);
+  const uint8x16_t mhi = vdupq_n_u8(0xF0);
 
   #pragma omp parallel for schedule(static)
   for (int64_t n = 0; n < N; n++) {
     const int8_t *wp = W_packed + n * row_bytes;
+    // Prefetch the weight row a few cache lines ahead.
+    __builtin_prefetch(wp + 64);
+    __builtin_prefetch(wp + 128);
     float32x4_t fp_acc = vdupq_n_f32(0.0f);
 
     for (int64_t kb = 0; kb < K_blocks; kb++) {
-      // Weight: 16 bytes nibbles + 2 bytes fp16 scale.
-      uint8x16_t v0 = vld1q_u8(reinterpret_cast<const uint8_t *>(wp));
+      // Prefetch a couple K-blocks ahead (each K-block is 18 bytes, prefetch
+      // up to 4 K-blocks ahead = 72 bytes ≈ next cache line).
+      if (kb + 4 < K_blocks) __builtin_prefetch(wp + 4 * 18);
+      // Bytes are stored as (signed_4bit_2's_complement_low) | (signed_4bit_high << 4),
+      // i.e. caller pre-XOR'd with 0x88 to convert from unsigned [0..15] = signed - 8.
+      // After `shl #4`, low nibble moves to upper 4 bits and is sign-extended → original signed × 16.
+      // After `and 0xF0`, high nibble stays in upper 4 bits → original signed × 16.
+      // Final dequant uses vcvtq_n_f32_s32(_, 4) which divides by 16 implicitly.
+      int8x16_t v0 = vld1q_s8(wp);
       uint16_t scale_h;
       std::memcpy(&scale_h, wp + 16, 2);
       wp += 18;
-
-      // Unpack low and high nibbles to int8, then signed-shift via subtract 8.
-      int8x16_t lo = vreinterpretq_s8_u8(vandq_u8(v0, m4b));         // 16 nibbles [0..15]
-      int8x16_t hi = vreinterpretq_s8_u8(vshrq_n_u8(v0, 4));          // 16 nibbles [0..15]
-      int8x16_t lo_s = vsubq_s8(lo, s8b);                              // [0..15] - 8 = [-8..7]
-      int8x16_t hi_s = vsubq_s8(hi, s8b);
-
-      // Activation 32 int8 in two halves matching the Q4_0 layout
-      // (low nibbles correspond to k=0..15, high to k=16..31).
+      int8x16_t lo16x = vshlq_n_s8(v0, 4);
+      int8x16_t hi16x = vreinterpretq_s8_u8(vandq_u8(vreinterpretq_u8_s8(v0), mhi));
       const int8_t *xp = x_int8 + kb * 32;
       int8x16_t y_lo = vld1q_s8(xp);
       int8x16_t y_hi = vld1q_s8(xp + 16);
-
-      int32x4_t int_acc = vdupq_n_s32(0);
-      int_acc = vdotq_s32(int_acc, lo_s, y_lo);
-      int_acc = vdotq_s32(int_acc, hi_s, y_hi);
-
-      // fp16 → fp32 scalar dequant (one per K-block per N)
-      uint32_t bits = (uint32_t)scale_h;
-      float scale_f;
-      // Use f16 native conversion via NEON scalar:
+      int32x4_t int_acc = vdotq_s32(vdupq_n_s32(0), lo16x, y_lo);
+      int_acc = vdotq_s32(int_acc, hi16x, y_hi);
       __fp16 h;
       std::memcpy(&h, &scale_h, 2);
-      scale_f = (float)h;
-
-      fp_acc = vmlaq_n_f32(fp_acc, vcvtq_f32_s32(int_acc), scale_f);
+      fp_acc = vmlaq_n_f32(fp_acc, vcvtq_n_f32_s32(int_acc, 4), (float)h);
     }
-
-    // Reduce 4 lanes, multiply by activation scale, write bf16.
     float dot = vaddvq_f32(fp_acc) * x_scale;
     uint32_t bits;
     std::memcpy(&bits, &dot, 4);
@@ -598,7 +588,7 @@ EXPORT void sdot_gemv_m1_q4_0_v2_fused_bf16(
 
 EXPORT void sdot_gemm_q4_0_v2_smmla_bf16(
     const uint16_t *x_bf16,   // [M, K] bf16 activation, M outer
-    const int8_t   *W_packed, // [N × K/32 × 18 bytes] int8 (Q4_0 v2 layout)
+    const int8_t   *W_packed, // [N × K/32 × 18 bytes] int8 (Q4_0 v2 kxor layout)
     uint16_t       *out_bf16, // [M, N] bf16 output
     int64_t M, int64_t K, int64_t N) {
   if (M < 2) return;  // caller falls back for M=1
@@ -606,7 +596,6 @@ EXPORT void sdot_gemm_q4_0_v2_smmla_bf16(
   const int64_t row_bytes = K_blocks * 18;
 
   // Quantize all M activation rows to int8 with per-row fp32 scale.
-  // Buffer x_int8 [M, K], scales [M].
   std::vector<int8_t> x_int8_buf(M * K);
   std::vector<float>  x_scales(M);
   for (int64_t m = 0; m < M; m++) {
@@ -614,50 +603,47 @@ EXPORT void sdot_gemm_q4_0_v2_smmla_bf16(
                                             x_int8_buf.data() + m * K, K);
   }
 
-  const int8x16_t s8b = vdupq_n_s8(8);
-  const uint8x16_t m4b = vdupq_n_u8(0x0F);
+  const uint8x16_t mhi = vdupq_n_u8(0xF0);
 
-  // Process rows in pairs (m0, m1=m0+1). If M is odd the last row is
-  // handled afterwards via the M=1 path on a per-N basis (keep simple here:
-  // assume caller pads or we handle leftover at end).
   const int64_t M_pairs = M / 2;
   const int64_t M_left  = M % 2;
 
-  // Parallel over N-pairs (each thread handles a chunk of n0=0,2,4,...)
   #pragma omp parallel for schedule(static)
   for (int64_t np = 0; np < N / 2; np++) {
     int64_t n0 = np * 2;
     int64_t n1 = n0 + 1;
 
-    // Iterate M pairs
     for (int64_t mp = 0; mp < M_pairs; mp++) {
       int64_t m0 = mp * 2;
       int64_t m1 = m0 + 1;
       float xs0 = x_scales[m0];
       float xs1 = x_scales[m1];
 
-      // 2x2 fp32 accumulator (m0n0, m0n1, m1n0, m1n1)
       float32x4_t fp_acc = vdupq_n_f32(0.0f);
 
       for (int64_t kb = 0; kb < K_blocks; kb++) {
-        // Load weight bytes + scales for n0, n1 at this K-block
         const int8_t *wp0 = W_packed + n0 * row_bytes + kb * 18;
         const int8_t *wp1 = W_packed + n1 * row_bytes + kb * 18;
-        uint8x16_t w0 = vld1q_u8(reinterpret_cast<const uint8_t *>(wp0));
-        uint8x16_t w1 = vld1q_u8(reinterpret_cast<const uint8_t *>(wp1));
+        int8x16_t w0 = vld1q_s8(wp0);
+        int8x16_t w1 = vld1q_s8(wp1);
         uint16_t s0_h, s1_h;
         std::memcpy(&s0_h, wp0 + 16, 2);
         std::memcpy(&s1_h, wp1 + 16, 2);
         __fp16 h0, h1;
         std::memcpy(&h0, &s0_h, 2);
         std::memcpy(&h1, &s1_h, 2);
-        float ws0 = (float)h0;
-        float ws1 = (float)h1;
+        // kxor: divide-by-16 happens via vcvtq_n_f32_s32(_, 4); fold that into
+        // the scale so we can keep using vmlaq_n_f32 with one constant per N.
+        float ws0 = (float)h0 / 16.0f;
+        float ws1 = (float)h1 / 16.0f;
 
-        int8x16_t lo0 = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(w0, m4b)), s8b);
-        int8x16_t hi0 = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(w0, 4)), s8b);
-        int8x16_t lo1 = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(w1, m4b)), s8b);
-        int8x16_t hi1 = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(w1, 4)), s8b);
+        // shl/and trick: low nibble in upper 4 bits via vshlq_n; high nibble
+        // already in upper 4 bits via vandq_u8(_, 0xF0). Original signed
+        // values × 16, undone later by per-N scale fold.
+        int8x16_t lo0 = vshlq_n_s8(w0, 4);
+        int8x16_t hi0 = vreinterpretq_s8_u8(vandq_u8(vreinterpretq_u8_s8(w0), mhi));
+        int8x16_t lo1 = vshlq_n_s8(w1, 4);
+        int8x16_t hi1 = vreinterpretq_s8_u8(vandq_u8(vreinterpretq_u8_s8(w1), mhi));
 
         const int8_t *xp0 = x_int8_buf.data() + m0 * K + kb * 32;
         const int8_t *xp1 = x_int8_buf.data() + m1 * K + kb * 32;
@@ -723,24 +709,30 @@ EXPORT void sdot_gemm_q4_0_v2_smmla_bf16(
  * [0..15], with subtract-8 decoding) plus per-(N, K_block_32) fp16 scales,
  * into the v2 layout [N × K/32 × 18 bytes]. Used by the Python pack helper
  * via ctypes; kernel itself only consumes the packed buffer. */
+/* Pack [K, N] unsigned-nibble weights ([0..15] = signed - 8) plus
+ * per-(K_block, N) fp16 scales into the v2 kxor layout
+ * [N × K/32 × 18 bytes]. The data bytes are XOR'd with 0x88 so each
+ * nibble becomes the 4-bit two's-complement of the original signed
+ * weight, letting the SDOT kernel use shl/and tricks to avoid an
+ * explicit subtract-8 step. */
 EXPORT void sdot_pack_weights_q4_0_v2(
-    const int8_t   *w_nibbles_kn,       // [K, N] int8 with values [0..15]  (K-major to match standard Linear weight transpose convention)
-    const uint16_t *block_scales_kn,    // [K/32, N] fp16 per-(K_block, output_row)
-    int8_t         *out,                // [N × K/32 × 18] int8 packed
+    const int8_t   *w_nibbles_kn,       // [K, N] int8 with values [0..15]
+    const uint16_t *block_scales_kn,    // [K/32, N] fp16
+    int8_t         *out,                // [N × K/32 × 18] int8 packed (kxor)
     int64_t K, int64_t N) {
   const int64_t K_blocks = K / 32;
   for (int64_t n = 0; n < N; n++) {
     int8_t *dst = out + n * K_blocks * 18;
     for (int64_t kb = 0; kb < K_blocks; kb++) {
-      // 16 bytes packed nibbles for this (n, kb) block
       for (int b = 0; b < 16; b++) {
         int low_k  = kb * 32 + b;
         int high_k = kb * 32 + b + 16;
         uint8_t lo = (uint8_t)(w_nibbles_kn[low_k  * N + n] & 0x0F);
         uint8_t hi = (uint8_t)(w_nibbles_kn[high_k * N + n] & 0x0F);
-        dst[b] = (int8_t)((hi << 4) | lo);
+        // XOR 0x88: convert nibble [0..15] (encoding signed - 8) to its
+        // 4-bit two's-complement representation of the signed value.
+        dst[b] = (int8_t)(((hi << 4) | lo) ^ 0x88);
       }
-      // 2 bytes fp16 scale at offset 16
       uint16_t s = block_scales_kn[kb * N + n];
       std::memcpy(dst + 16, &s, 2);
       dst += 18;
