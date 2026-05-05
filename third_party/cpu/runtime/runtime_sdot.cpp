@@ -377,34 +377,63 @@ static void sdot_gemv_q4_0_range(const int8_t *A_int8, const int8_t *B_w4,
       int8x16_t av = vreinterpretq_s8_s32(vdupq_n_s32(a4));
 
       // Inner loop: iterate N-stripes sequentially (cache-friendly).
+      // For 2 adjacent N-stripes at the same K-stripe, packed weights are
+      // contiguous (16 bytes total). One vld1q_s8 + one shift sequence
+      // produces unpacked operands for 2 SDOTs, halving the unpack cost
+      // per SDOT vs the 8-byte-load-per-SDOT pattern.
       // Weight ptr: stripe (kb=kb_super*8+j, nb) is at offset
       //   (kb*N4 + nb) * 8 bytes.
       const int8_t *bp = B_w4 + (((kb_super * 8 + j) * N4 + nb_start) * 8);
 
       int64_t i = 0;
-      for (; i + 4 <= nb_count; i += 4) {
-        // 4-way unroll for ILP
-        int8x8_t p0 = vld1_s8(bp);     bp += 8;
-        int8x8_t p1 = vld1_s8(bp);     bp += 8;
-        int8x8_t p2 = vld1_s8(bp);     bp += 8;
-        int8x8_t p3 = vld1_s8(bp);     bp += 8;
-        int8x8_t lo0 = vshr_n_s8(vshl_n_s8(p0, 4), 4);
-        int8x8_t lo1 = vshr_n_s8(vshl_n_s8(p1, 4), 4);
-        int8x8_t lo2 = vshr_n_s8(vshl_n_s8(p2, 4), 4);
-        int8x8_t lo3 = vshr_n_s8(vshl_n_s8(p3, 4), 4);
-        int8x8_t hi0 = vshr_n_s8(p0, 4);
-        int8x8_t hi1 = vshr_n_s8(p1, 4);
-        int8x8_t hi2 = vshr_n_s8(p2, 4);
-        int8x8_t hi3 = vshr_n_s8(p3, 4);
-        int8x16_t b0 = vzip1q_s8(vcombine_s8(lo0, vdup_n_s8(0)), vcombine_s8(hi0, vdup_n_s8(0)));
-        int8x16_t b1 = vzip1q_s8(vcombine_s8(lo1, vdup_n_s8(0)), vcombine_s8(hi1, vdup_n_s8(0)));
-        int8x16_t b2 = vzip1q_s8(vcombine_s8(lo2, vdup_n_s8(0)), vcombine_s8(hi2, vdup_n_s8(0)));
-        int8x16_t b3 = vzip1q_s8(vcombine_s8(lo3, vdup_n_s8(0)), vcombine_s8(hi3, vdup_n_s8(0)));
+      // 8-way unroll: 4 × (2-stripe load) = 64 bytes of weight per iter,
+      // 8 SDOTs per iter, ILP across 8 independent accumulators.
+      for (; i + 8 <= nb_count; i += 8) {
+        int8x16_t pp0 = vld1q_s8(bp);       bp += 16;
+        int8x16_t pp1 = vld1q_s8(bp);       bp += 16;
+        int8x16_t pp2 = vld1q_s8(bp);       bp += 16;
+        int8x16_t pp3 = vld1q_s8(bp);       bp += 16;
+        // Sign-extend low and high nibbles of each 16-byte register.
+        int8x16_t lo0 = vshrq_n_s8(vshlq_n_s8(pp0, 4), 4);
+        int8x16_t hi0 = vshrq_n_s8(pp0, 4);
+        int8x16_t lo1 = vshrq_n_s8(vshlq_n_s8(pp1, 4), 4);
+        int8x16_t hi1 = vshrq_n_s8(pp1, 4);
+        int8x16_t lo2 = vshrq_n_s8(vshlq_n_s8(pp2, 4), 4);
+        int8x16_t hi2 = vshrq_n_s8(pp2, 4);
+        int8x16_t lo3 = vshrq_n_s8(vshlq_n_s8(pp3, 4), 4);
+        int8x16_t hi3 = vshrq_n_s8(pp3, 4);
+        // Each 16-byte load packs 2 (4K, 4N) blocks at adjacent nb.
+        // vzip1q gives lo[0..7]+hi[0..7] interleaved = first SDOT operand
+        // (covers nb+0); vzip2q gives lo[8..15]+hi[8..15] = second SDOT
+        // operand (covers nb+1).
+        int8x16_t b0 = vzip1q_s8(lo0, hi0);
+        int8x16_t b1 = vzip2q_s8(lo0, hi0);
+        int8x16_t b2 = vzip1q_s8(lo1, hi1);
+        int8x16_t b3 = vzip2q_s8(lo1, hi1);
+        int8x16_t b4 = vzip1q_s8(lo2, hi2);
+        int8x16_t b5 = vzip2q_s8(lo2, hi2);
+        int8x16_t b6 = vzip1q_s8(lo3, hi3);
+        int8x16_t b7 = vzip2q_s8(lo3, hi3);
         int_acc[i]   = vdotq_s32(int_acc[i],   av, b0);
         int_acc[i+1] = vdotq_s32(int_acc[i+1], av, b1);
         int_acc[i+2] = vdotq_s32(int_acc[i+2], av, b2);
         int_acc[i+3] = vdotq_s32(int_acc[i+3], av, b3);
+        int_acc[i+4] = vdotq_s32(int_acc[i+4], av, b4);
+        int_acc[i+5] = vdotq_s32(int_acc[i+5], av, b5);
+        int_acc[i+6] = vdotq_s32(int_acc[i+6], av, b6);
+        int_acc[i+7] = vdotq_s32(int_acc[i+7], av, b7);
       }
+      // 2-way unroll for remaining pairs.
+      for (; i + 2 <= nb_count; i += 2) {
+        int8x16_t pp = vld1q_s8(bp);     bp += 16;
+        int8x16_t lo = vshrq_n_s8(vshlq_n_s8(pp, 4), 4);
+        int8x16_t hi = vshrq_n_s8(pp, 4);
+        int8x16_t b0 = vzip1q_s8(lo, hi);
+        int8x16_t b1 = vzip2q_s8(lo, hi);
+        int_acc[i]   = vdotq_s32(int_acc[i],   av, b0);
+        int_acc[i+1] = vdotq_s32(int_acc[i+1], av, b1);
+      }
+      // Single-stripe tail.
       for (; i < nb_count; i++) {
         int8x8_t p = vld1_s8(bp);
         int8x8_t lo = vshr_n_s8(vshl_n_s8(p, 4), 4);
