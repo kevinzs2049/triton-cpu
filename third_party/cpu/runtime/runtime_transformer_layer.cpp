@@ -531,7 +531,67 @@ EXPORT void standalone_rms_norm_gated_bf16(
     const uint16_t *weight,  // [D]    bf16
     uint16_t       *out,     // [M, D] bf16
     int64_t M, int64_t D, float eps) {
-  #pragma omp parallel for schedule(static)
+  // Threshold: M=16 D=128 (Qwen3.5-2B) is faster single-threaded because
+  // OMP fork/join (~3-5μs) exceeds per-thread compute (~1μs for 2 rows).
+  // M=32 D=128 (Qwen3.5-4B linear_num_value_heads=32) benefits from OMP
+  // (each thread does 4 rows × ~6μs = 24μs, vs 192μs single-threaded).
+  // Threshold: enable OMP when total work (M × D) ≥ 2048 bytes equivalent.
+  if (M >= 24) {
+    #pragma omp parallel for schedule(static)
+    for (int64_t m = 0; m < M; m++) {
+      const uint16_t *xr  = x_in    + m * D;
+      const uint16_t *gr  = gate_in + m * D;
+      uint16_t       *or_ = out     + m * D;
+      float32x4_t ss = vdupq_n_f32(0.0f);
+      int64_t d;
+      for (d = 0; d + 4 <= D; d += 4) {
+        float32x4_t v = bf16x4_to_f32(xr + d);
+        ss = vfmaq_f32(ss, v, v);
+      }
+      float sum_sq = vaddvq_f32(ss);
+      for (; d < D; d++) {
+        uint32_t bits = (uint32_t)xr[d] << 16;
+        float v;
+        std::memcpy(&v, &bits, 4);
+        sum_sq += v * v;
+      }
+      float rms = 1.0f / sqrtf(sum_sq / (float)D + eps);
+      float32x4_t vrms = vdupq_n_f32(rms);
+      for (d = 0; d + 4 <= D; d += 4) {
+        float32x4_t xn = vmulq_f32(bf16x4_to_f32(xr + d), vrms);
+        float32x4_t w  = bf16x4_to_f32(weight + d);
+        float32x4_t g  = bf16x4_to_f32(gr + d);
+        float xn_arr[4], w_arr[4], g_arr[4];
+        vst1q_f32(xn_arr, xn);
+        vst1q_f32(w_arr, w);
+        vst1q_f32(g_arr, g);
+        uint16_t bf[4];
+        for (int i = 0; i < 4; i++) {
+          float silu = silu_bf16_to_f32(g_arr[i]);
+          float val = xn_arr[i] * w_arr[i] * silu;
+          uint32_t bits;
+          std::memcpy(&bits, &val, 4);
+          bf[i] = (uint16_t)(bits >> 16);
+        }
+        vst1_u16(or_ + d, vld1_u16(bf));
+      }
+      for (; d < D; d++) {
+        uint32_t bx = (uint32_t)xr[d] << 16;
+        uint32_t bw = (uint32_t)weight[d] << 16;
+        uint32_t bg = (uint32_t)gr[d] << 16;
+        float vx, vw, vg;
+        std::memcpy(&vx, &bx, 4);
+        std::memcpy(&vw, &bw, 4);
+        std::memcpy(&vg, &bg, 4);
+        float val = vx * rms * vw * silu_bf16_to_f32(vg);
+        uint32_t bits;
+        std::memcpy(&bits, &val, 4);
+        or_[d] = (uint16_t)(bits >> 16);
+      }
+    }
+    return;
+  }
+  // Small-M path (single-threaded).
   for (int64_t m = 0; m < M; m++) {
     const uint16_t *xr  = x_in    + m * D;
     const uint16_t *gr  = gate_in + m * D;
