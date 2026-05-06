@@ -1660,6 +1660,13 @@ void init_triton_ir(py::module &&m) {
                  x, gate, weight, out, M, D,
                  self.getBuilder().getF32FloatAttr(eps));
            })
+      .def("create_cpu_fused_swiglu_q4_0_v2",
+           [](TritonOpBuilder &self, mlir::Value &x_ptr,
+              mlir::Value &gate_packed, mlir::Value &up_packed,
+              mlir::Value &out_ptr, mlir::Value &K, mlir::Value &N) {
+             self.create<CpuFusedSwigluQ40V2Op>(
+                 x_ptr, gate_packed, up_packed, out_ptr, K, N);
+           })
       .def("create_cpu_causal_conv1d_update",
            [](TritonOpBuilder &self, mlir::Value &hidden, mlir::Value &state,
               mlir::Value &weight, mlir::Value &bias, mlir::Value &out,

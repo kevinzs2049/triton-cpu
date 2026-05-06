@@ -897,6 +897,20 @@ def TT_CpuRmsNormGatedOp : TT_Op<"cpu_rms_norm_gated", []> {
     let assemblyFormat = "$x_ptr `,` $gate_ptr `,` $weight_ptr `,` $out_ptr `,` $M `,` $D attr-dict `:` type($x_ptr) `,` type($gate_ptr) `,` type($weight_ptr) `,` type($out_ptr)";
 }
 
+//
+// TLE-CPU: Fused SwiGLU on Q4_0 v2 weights (gate + up SDOT GEMV + silu(gate) * up).
+// Replaces the 5-op ATen MLP first-half (gate_proj, up_proj, silu, mul, alloc/free)
+// with a single dispatch. K, N: dimensions; require K % 32 == 0, N % 4 == 0.
+//
+def TT_CpuFusedSwigluQ40V2Op : TT_Op<"cpu_fused_swiglu_q4_0_v2", []> {
+    let summary = "TLE-CPU: Fused SwiGLU (gate+up Q4_0 v2 GEMV + silu*mul)";
+    let arguments = (ins TT_Ptr:$x_ptr, TT_Ptr:$gate_packed_ptr,
+                         TT_Ptr:$up_packed_ptr, TT_Ptr:$out_ptr,
+                         I64:$K, I64:$N);
+    let results = (outs);
+    let assemblyFormat = "$x_ptr `,` $gate_packed_ptr `,` $up_packed_ptr `,` $out_ptr `,` $K `,` $N attr-dict `:` type($x_ptr) `,` type($gate_packed_ptr) `,` type($up_packed_ptr) `,` type($out_ptr)";
+}
+
 def TT_CpuRmsNormOp : TT_Op<"cpu_rms_norm", []> {
     let summary = "TLE-CPU: RMSNorm (x / rms(x) * weight)";
     let arguments = (ins TT_Ptr:$x_ptr, TT_Ptr:$weight_ptr, TT_Ptr:$out_ptr, I64:$D, F32Attr:$eps);
