@@ -70,6 +70,7 @@ public:
     addLegalOp<triton::CpuGemmQ40V2SmmlaBf16Op>();
     addLegalOp<triton::CpuSdotPackWeightsOp>();
     addLegalOp<triton::CpuRmsNormOp>();
+    addLegalOp<triton::CpuRmsNormGatedOp>();
     addLegalOp<triton::CpuGatedDeltaDecodeOp>();
     addLegalOp<triton::CpuCausalConv1dUpdateOp>();
     addLegalOp<triton::CpuSwigluOp>();

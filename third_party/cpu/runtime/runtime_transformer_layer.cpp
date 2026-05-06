@@ -514,6 +514,83 @@ EXPORT void standalone_kv_cache_write_bf16(
   }
 }
 
+/* Multi-row RMSNormGated (Qwen3_5RMSNormGated) in one kernel call:
+ *   per row m: out[m] = rms_norm(x[m]) * weight * silu(gate[m])
+ * where rms_norm(x) = x / sqrt(mean(x²) + eps).
+ *
+ * Replaces a 6-op ATen sequence per row × M rows × per-token call site.
+ * For Qwen3.5 GDN this is M=16 (head count) × D=128 (head_v_dim).
+ */
+static inline float silu_bf16_to_f32(float x) {
+  return x / (1.0f + expf(-x));
+}
+
+EXPORT void standalone_rms_norm_gated_bf16(
+    const uint16_t *x_in,    // [M, D] bf16
+    const uint16_t *gate_in, // [M, D] bf16
+    const uint16_t *weight,  // [D]    bf16
+    uint16_t       *out,     // [M, D] bf16
+    int64_t M, int64_t D, float eps) {
+  #pragma omp parallel for schedule(static)
+  for (int64_t m = 0; m < M; m++) {
+    const uint16_t *xr  = x_in    + m * D;
+    const uint16_t *gr  = gate_in + m * D;
+    uint16_t       *or_ = out     + m * D;
+
+    // Pass 1: sum of squares for normalization.
+    float32x4_t ss = vdupq_n_f32(0.0f);
+    int64_t d;
+    for (d = 0; d + 4 <= D; d += 4) {
+      float32x4_t v = bf16x4_to_f32(xr + d);
+      ss = vfmaq_f32(ss, v, v);
+    }
+    float sum_sq = vaddvq_f32(ss);
+    for (; d < D; d++) {
+      uint32_t bits = (uint32_t)xr[d] << 16;
+      float v;
+      std::memcpy(&v, &bits, 4);
+      sum_sq += v * v;
+    }
+    float rms = 1.0f / sqrtf(sum_sq / (float)D + eps);
+
+    // Pass 2: out = (x * rms) * weight * silu(gate).
+    float32x4_t vrms = vdupq_n_f32(rms);
+    for (d = 0; d + 4 <= D; d += 4) {
+      float32x4_t xn = vmulq_f32(bf16x4_to_f32(xr + d), vrms);
+      float32x4_t w  = bf16x4_to_f32(weight + d);
+      float32x4_t g  = bf16x4_to_f32(gr + d);
+      // SiLU: g / (1 + exp(-g))
+      // No native NEON exp; do it scalar lane-wise.
+      float xn_arr[4], w_arr[4], g_arr[4];
+      vst1q_f32(xn_arr, xn);
+      vst1q_f32(w_arr, w);
+      vst1q_f32(g_arr, g);
+      uint16_t bf[4];
+      for (int i = 0; i < 4; i++) {
+        float silu = silu_bf16_to_f32(g_arr[i]);
+        float val = xn_arr[i] * w_arr[i] * silu;
+        uint32_t bits;
+        std::memcpy(&bits, &val, 4);
+        bf[i] = (uint16_t)(bits >> 16);
+      }
+      vst1_u16(or_ + d, vld1_u16(bf));
+    }
+    for (; d < D; d++) {
+      uint32_t bx = (uint32_t)xr[d] << 16;
+      uint32_t bw = (uint32_t)weight[d] << 16;
+      uint32_t bg = (uint32_t)gr[d] << 16;
+      float vx, vw, vg;
+      std::memcpy(&vx, &bx, 4);
+      std::memcpy(&vw, &bw, 4);
+      std::memcpy(&vg, &bg, 4);
+      float val = vx * rms * vw * silu_bf16_to_f32(vg);
+      uint32_t bits;
+      std::memcpy(&bits, &val, 4);
+      or_[d] = (uint16_t)(bits >> 16);
+    }
+  }
+}
+
 /* ═══════════════════════════════════════════════════════════
  * Gated Delta Net recurrent decode (T=1) — fp32, NEON.
  *
@@ -789,5 +866,8 @@ EXPORT void standalone_causal_conv1d_update_bf16(
     const uint16_t *, uint16_t *, const uint16_t *,
     const uint16_t *, uint16_t *,
     int64_t, int64_t, int64_t, int64_t, int64_t) {}
+EXPORT void standalone_rms_norm_gated_bf16(
+    const uint16_t *, const uint16_t *, const uint16_t *,
+    uint16_t *, int64_t, int64_t, float) {}
 }
 #endif
