@@ -837,6 +837,17 @@ def TT_CpuFlashAttnDecodeOp : TT_Op<"cpu_flash_attn_decode", []> {
 //
 // TLE-CPU: RMSNorm (out = x / rms(x) * weight)
 //
+//
+// TLE-CPU: RMSNormGated (rms_norm(x) * weight * silu(gate)) — multi-row.
+//
+def TT_CpuRmsNormGatedOp : TT_Op<"cpu_rms_norm_gated", []> {
+    let summary = "TLE-CPU: RMSNormGated multi-row (norm + silu-gate fused)";
+    let arguments = (ins TT_Ptr:$x_ptr, TT_Ptr:$gate_ptr, TT_Ptr:$weight_ptr,
+                         TT_Ptr:$out_ptr, I64:$M, I64:$D, F32Attr:$eps);
+    let results = (outs);
+    let assemblyFormat = "$x_ptr `,` $gate_ptr `,` $weight_ptr `,` $out_ptr `,` $M `,` $D attr-dict `:` type($x_ptr) `,` type($gate_ptr) `,` type($weight_ptr) `,` type($out_ptr)";
+}
+
 def TT_CpuRmsNormOp : TT_Op<"cpu_rms_norm", []> {
     let summary = "TLE-CPU: RMSNorm (x / rms(x) * weight)";
     let arguments = (ins TT_Ptr:$x_ptr, TT_Ptr:$weight_ptr, TT_Ptr:$out_ptr, I64:$D, F32Attr:$eps);

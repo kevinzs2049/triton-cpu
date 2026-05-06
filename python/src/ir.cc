@@ -1607,6 +1607,14 @@ void init_triton_ir(py::module &&m) {
                  x, weight, out, D,
                  self.getBuilder().getF32FloatAttr(eps));
            })
+      .def("create_cpu_rms_norm_gated",
+           [](TritonOpBuilder &self, mlir::Value &x, mlir::Value &gate,
+              mlir::Value &weight, mlir::Value &out,
+              mlir::Value &M, mlir::Value &D, float eps) {
+             self.create<CpuRmsNormGatedOp>(
+                 x, gate, weight, out, M, D,
+                 self.getBuilder().getF32FloatAttr(eps));
+           })
       .def("create_cpu_causal_conv1d_update",
            [](TritonOpBuilder &self, mlir::Value &hidden, mlir::Value &state,
               mlir::Value &weight, mlir::Value &bias, mlir::Value &out,

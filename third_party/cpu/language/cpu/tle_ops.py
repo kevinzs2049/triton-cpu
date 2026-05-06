@@ -108,6 +108,25 @@ def flash_attn_decode(q_ptr, k_ptr, v_ptr, out_ptr,
 
 
 @builtin
+def rms_norm_gated(x_ptr, gate_ptr, weight_ptr, out_ptr, M, D, eps, _builder=None):
+    """TLE-CPU: RMSNormGated multi-row — out = rms_norm(x) * weight * silu(gate).
+
+    Replaces a 6-op ATen sequence per row × M rows. Per-row OMP parallel.
+    Used by Qwen3.5 GDN's Qwen3_5RMSNormGated module (M = num_v_heads,
+    D = head_v_dim, typically M=16 D=128).
+    """
+    M_raw = _unwrap_if_constexpr(M)
+    D_raw = _unwrap_if_constexpr(D)
+    M_val = M_raw.handle if hasattr(M_raw, 'handle') else _builder.get_int64(M_raw)
+    D_val = D_raw.handle if hasattr(D_raw, 'handle') else _builder.get_int64(D_raw)
+    eps_f = float(_unwrap_if_constexpr(eps))
+    _builder.create_cpu_rms_norm_gated(
+        x_ptr.handle, gate_ptr.handle, weight_ptr.handle, out_ptr.handle,
+        M_val, D_val, eps_f)
+    return None
+
+
+@builtin
 def rms_norm(x_ptr, weight_ptr, out_ptr, D, eps, _builder=None):
     """TLE-CPU: RMSNorm — out = (x / rms(x)) * weight.
 
