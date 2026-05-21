@@ -911,6 +911,20 @@ def TT_CpuFusedSwigluQ40V2Op : TT_Op<"cpu_fused_swiglu_q4_0_v2", []> {
     let assemblyFormat = "$x_ptr `,` $gate_packed_ptr `,` $up_packed_ptr `,` $out_ptr `,` $K `,` $N attr-dict `:` type($x_ptr) `,` type($gate_packed_ptr) `,` type($up_packed_ptr) `,` type($out_ptr)";
 }
 
+//
+// TLE-CPU: KleidiAI Q4 GEMV decode (M=1, BF16). Uses Arm KleidiAI's
+// hand-tuned 8-N grouped pack assembly kernel via libTritonCPURuntime
+// wrapper kleidi_q4_gemv_bf16. Weights must be pre-packed via the
+// kleidi_pack_q4_weights helper.
+//
+def TT_CpuKleidiQ4GemvBf16Op : TT_Op<"cpu_kleidi_q4_gemv_bf16", []> {
+    let summary = "TLE-CPU: KleidiAI 8-N Q4_0 GEMV decode (M=1, BF16)";
+    let arguments = (ins TT_Ptr:$x_ptr, TT_Ptr:$rhs_packed_ptr,
+                         TT_Ptr:$out_ptr, I64:$K, I64:$N);
+    let results = (outs);
+    let assemblyFormat = "$x_ptr `,` $rhs_packed_ptr `,` $out_ptr `,` $K `,` $N attr-dict `:` type($x_ptr) `,` type($rhs_packed_ptr) `,` type($out_ptr)";
+}
+
 def TT_CpuRmsNormOp : TT_Op<"cpu_rms_norm", []> {
     let summary = "TLE-CPU: RMSNorm (x / rms(x) * weight)";
     let arguments = (ins TT_Ptr:$x_ptr, TT_Ptr:$weight_ptr, TT_Ptr:$out_ptr, I64:$D, F32Attr:$eps);

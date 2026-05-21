@@ -652,6 +652,47 @@ struct RmsNormGatedOpLowering
   }
 };
 
+// ---------- CpuKleidiQ4GemvBf16Op → runtime call ----------
+
+struct KleidiQ4GemvBf16OpLowering
+    : public OpRewritePattern<triton::CpuKleidiQ4GemvBf16Op> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(triton::CpuKleidiQ4GemvBf16Op op,
+                                PatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    auto ctx = rewriter.getContext();
+    auto module = op->getParentOfType<ModuleOp>();
+    auto i64Ty = IntegerType::get(ctx, 64);
+    auto ptrTy = LLVM::LLVMPointerType::get(ctx);
+
+    auto funcName = "kleidi_q4_gemv_bf16";
+    auto funcOp = module.lookupSymbol<LLVM::LLVMFuncOp>(funcName);
+    if (!funcOp) {
+      auto voidTy = LLVM::LLVMVoidType::get(ctx);
+      auto funcType = LLVM::LLVMFunctionType::get(
+          voidTy, {ptrTy, ptrTy, ptrTy, i64Ty, i64Ty}, false);
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(module.getBody());
+      funcOp = rewriter.create<LLVM::LLVMFuncOp>(
+          UnknownLoc::get(ctx), funcName, funcType);
+    }
+
+    auto castPtr = [&](Value v) -> Value {
+      if (isa<LLVM::LLVMPointerType>(v.getType())) return v;
+      return rewriter.create<UnrealizedConversionCastOp>(loc, ptrTy, v)
+          .getResult(0);
+    };
+
+    rewriter.create<LLVM::CallOp>(
+        loc, funcOp,
+        ValueRange{castPtr(op.getXPtr()), castPtr(op.getRhsPackedPtr()),
+                   castPtr(op.getOutPtr()), op.getK(), op.getN()});
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
 // ---------- CpuFusedSwigluQ40V2Op → runtime call ----------
 
 struct FusedSwigluQ40V2OpLowering
@@ -917,6 +958,7 @@ std::unique_ptr<Pass> createNeonSdotToLLVMPass() {
       patterns.add<RmsNormOpLowering>(ctx);
       patterns.add<RmsNormGatedOpLowering>(ctx);
       patterns.add<FusedSwigluQ40V2OpLowering>(ctx);
+      patterns.add<KleidiQ4GemvBf16OpLowering>(ctx);
       patterns.add<GatedDeltaDecodeOpLowering>(ctx);
       patterns.add<CausalConv1dUpdateOpLowering>(ctx);
       patterns.add<SwigluOpLowering>(ctx);

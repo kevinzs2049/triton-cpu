@@ -1667,6 +1667,13 @@ void init_triton_ir(py::module &&m) {
              self.create<CpuFusedSwigluQ40V2Op>(
                  x_ptr, gate_packed, up_packed, out_ptr, K, N);
            })
+      .def("create_cpu_kleidi_q4_gemv_bf16",
+           [](TritonOpBuilder &self, mlir::Value &x_ptr,
+              mlir::Value &rhs_packed, mlir::Value &out_ptr,
+              mlir::Value &K, mlir::Value &N) {
+             self.create<CpuKleidiQ4GemvBf16Op>(
+                 x_ptr, rhs_packed, out_ptr, K, N);
+           })
       .def("create_cpu_causal_conv1d_update",
            [](TritonOpBuilder &self, mlir::Value &hidden, mlir::Value &state,
               mlir::Value &weight, mlir::Value &bias, mlir::Value &out,
