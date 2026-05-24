@@ -27,7 +27,7 @@ def _is_apple_clang():
     return "Apple clang" in res.stdout
 
 
-def _build(name, src, srcdir, library_dirs, include_dirs, libraries):
+def _build(name, src, srcdir, library_dirs, include_dirs, libraries, extra_objects=None):
     suffix = sysconfig.get_config_var('EXT_SUFFIX')
     system = platform.system()
     machine = platform.machine()
@@ -89,12 +89,21 @@ def _build(name, src, srcdir, library_dirs, include_dirs, libraries):
     if src.endswith(".s"):
         # This is required to properly parse .file directives
         cc_cmd += ["-g"]
-        if system == "Linux" and machine in ("aarch64", "arm64"):
-            # On Arm backend, some CPU (neoverse-v2) needs to be specified through -mcpu
+    # ARM64: ensure SVE2 + i8mm + BF16 + dotprod codegen for runtime-compiled
+    # C++/assembly sources (needed by TLE C runtime ops that use NEON SDOT,
+    # SVE2 i8mm intrinsics, and bf16 ops).
+    if system == "Linux" and machine in ("aarch64", "arm64"):
+        if src.endswith((".cpp", ".cc", ".s")):
             cc_cmd += [
-                "-march=armv9-a+sve2+i8mm+bf16+fp16",
+                "-march=armv9-a+sve2+i8mm+bf16+fp16+dotprod",
                 "-msve-vector-bits=128",
             ]
+    # Link extra pre-built object files (used by the CPU backend to attach
+    # the TLE C runtime ops as .o files). When present, link with OpenMP
+    # since those .o files contain OMP regions.
+    if extra_objects:
+        cc_cmd += ["-fopenmp"]
+        cc_cmd += list(extra_objects)
     ret = subprocess.check_call(cc_cmd)
     if ret != 0:
         raise RuntimeError("Failed to compile so.")
