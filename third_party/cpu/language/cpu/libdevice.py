@@ -29,6 +29,31 @@ def atan(arg0, _builder=None):
     return core.tensor(_builder.create_atan(arg0.handle), arg0.type)
 
 
+@jit
+def atan2(y, x):
+    """Two-argument arctangent.
+
+    Pure-Triton fallback because the LLVM CPU backend lacks a direct atan2
+    intrinsic. Decomposes as atan(y/x) with quadrant correction. Output
+    range is (-pi, pi] matching libm atan2 semantics.
+    """
+    pi = 3.141592653589793
+    half_pi = 1.5707963267948966
+    zero = 0.0
+    one = 1.0
+
+    safe_x = tl.where(x == zero, one, x)
+    base = atan(y / safe_x)
+
+    # Quadrant correction
+    result = tl.where(x > zero, base, base)
+    result = tl.where((x < zero) & (y >= zero), base + pi, result)
+    result = tl.where((x < zero) & (y < zero), base - pi, result)
+    result = tl.where((x == zero) & (y > zero), half_pi, result)
+    result = tl.where((x == zero) & (y < zero), -half_pi, result)
+    return result
+
+
 @core.extern
 def atanh(arg0, _builder=None):
     return core.tensor(_builder.create_atanh(arg0.handle), arg0.type)
