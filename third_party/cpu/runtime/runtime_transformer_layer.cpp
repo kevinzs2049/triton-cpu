@@ -340,105 +340,8 @@ static void residual_add_bf16(uint16_t *residual, const uint16_t *x, int64_t D) 
   }
 }
 
-/* ═══════════════════════════════════════════════════════════
- * Main entry: fused_transformer_decode_layer
- * ═══════════════════════════════════════════════════════════ */
-
 extern "C" {
 
-EXPORT void fused_transformer_decode_layer(
-    /* I/O */
-    uint16_t *hidden_states,    /* [hidden] bf16, in-place updated */
-    /* Attention weights (INT8 SDOT packed) */
-    const int8_t *wq, const int8_t *wk, const int8_t *wv, const int8_t *wo,
-    const float *wq_s, const float *wk_s, const float *wv_s, const float *wo_s,
-    /* QK norm weights */
-    const uint16_t *q_norm_w, const uint16_t *k_norm_w,
-    /* RoPE embeddings for current position */
-    const uint16_t *cos_emb, const uint16_t *sin_emb,
-    /* KV cache (pre-allocated, contiguous per head) */
-    uint16_t *k_cache, uint16_t *v_cache, /* [n_kv_heads, max_seq, head_dim] */
-    int64_t cache_pos, int64_t max_seq_len,
-    /* MLP weights (INT8 SDOT packed) */
-    const int8_t *gate_w, const int8_t *up_w, const int8_t *down_w,
-    const float *gate_s, const float *up_s, const float *down_s,
-    /* LayerNorm weights */
-    const uint16_t *input_norm_w, const uint16_t *post_norm_w,
-    /* Dimensions */
-    int64_t hidden, int64_t head_dim, int64_t n_heads, int64_t n_kv_heads,
-    int64_t intermediate, float rms_eps
-) {
-  int64_t q_dim = n_heads * head_dim;
-  int64_t kv_dim = n_kv_heads * head_dim;
-  int64_t seq_len = cache_pos + 1;
-
-  /* Scratch buffers on stack (max hidden=2048, intermediate=6144) */
-  uint16_t norm_out[8192];     /* max(hidden, q_dim) */
-  uint16_t q_buf[4096];       /* n_heads * head_dim = 2048 */
-  uint16_t k_buf[2048];       /* n_kv_heads * head_dim = 1024 */
-  uint16_t v_buf[2048];
-  uint16_t attn_out[4096];    /* q_dim */
-  uint16_t o_out[8192];       /* hidden */
-  uint16_t mlp_out[8192];     /* hidden */
-  uint16_t mlp_scratch[8192]; /* intermediate */
-  int8_t int8_scratch[8192];  /* max(hidden, intermediate) */
-  uint16_t residual[8192];    /* hidden */
-
-  /* Save residual */
-  std::memcpy(residual, hidden_states, hidden * 2);
-
-  /* 1. Input RMSNorm */
-  rms_norm_bf16(hidden_states, input_norm_w, norm_out, hidden, rms_eps);
-
-  /* 2. Q/K/V GEMV */
-  float xs_dummy;
-  gemv_int8_bf16(norm_out, hidden, wq, wq_s, q_buf, q_dim, int8_scratch, &xs_dummy);
-  gemv_int8_bf16(norm_out, hidden, wk, wk_s, k_buf, kv_dim, int8_scratch, &xs_dummy);
-  gemv_int8_bf16(norm_out, hidden, wv, wv_s, v_buf, kv_dim, int8_scratch, &xs_dummy);
-
-  /* 3. QK Norm */
-  for (int64_t h = 0; h < n_heads; h++)
-    rms_norm_bf16(q_buf + h * head_dim, q_norm_w, q_buf + h * head_dim, head_dim, rms_eps);
-  for (int64_t h = 0; h < n_kv_heads; h++)
-    rms_norm_bf16(k_buf + h * head_dim, k_norm_w, k_buf + h * head_dim, head_dim, rms_eps);
-
-  /* 4. RoPE */
-  apply_rope_bf16(q_buf, k_buf, cos_emb, sin_emb, n_heads, n_kv_heads, head_dim);
-
-  /* 5. KV cache write (in-place, no cat) */
-  for (int64_t h = 0; h < n_kv_heads; h++) {
-    std::memcpy(k_cache + h * max_seq_len * head_dim + cache_pos * head_dim,
-                k_buf + h * head_dim, head_dim * 2);
-    std::memcpy(v_cache + h * max_seq_len * head_dim + cache_pos * head_dim,
-                v_buf + h * head_dim, head_dim * 2);
-  }
-
-  /* 6. Attention (online softmax) */
-  float sm_scale = 1.0f / sqrtf((float)head_dim);
-  flash_attn_decode(q_buf, k_cache, v_cache, attn_out,
-                     seq_len, head_dim, sm_scale, n_heads, n_kv_heads,
-                     max_seq_len);
-
-  /* 7. O projection */
-  gemv_int8_bf16(attn_out, q_dim, wo, wo_s, o_out, hidden, int8_scratch, &xs_dummy);
-
-  /* 8. Residual add */
-  residual_add_bf16(residual, o_out, hidden);
-
-  /* 9. Post-attention RMSNorm */
-  rms_norm_bf16(residual, post_norm_w, norm_out, hidden, rms_eps);
-
-  /* 10. Fused MLP: gate+up GEMV + SWIGLU + down GEMV */
-  fused_mlp_full(norm_out, hidden,
-                  gate_w, up_w, down_w,
-                  gate_s, up_s, down_s,
-                  mlp_out, intermediate,
-                  int8_scratch, mlp_scratch);
-
-  /* 11. Final residual add → output */
-  residual_add_bf16(residual, mlp_out, hidden);
-  std::memcpy(hidden_states, residual, hidden * 2);
-}
 
 /* ═══════════════════════════════════════════════════════════
  * Standalone ops: RMSNorm, RoPE, residual add, KV cache write
@@ -860,16 +763,6 @@ EXPORT void standalone_causal_conv1d_update_bf16(
 
 #else
 extern "C" {
-EXPORT void fused_transformer_decode_layer(
-    uint16_t *, const int8_t *, const int8_t *, const int8_t *, const int8_t *,
-    const float *, const float *, const float *, const float *,
-    const uint16_t *, const uint16_t *,
-    const uint16_t *, const uint16_t *,
-    uint16_t *, uint16_t *, int64_t, int64_t,
-    const int8_t *, const int8_t *, const int8_t *,
-    const float *, const float *, const float *,
-    const uint16_t *, const uint16_t *,
-    int64_t, int64_t, int64_t, int64_t, int64_t, float) {}
 EXPORT void standalone_rms_norm_bf16(
     const uint16_t *, const uint16_t *, uint16_t *, int64_t, float) {}
 EXPORT void standalone_rope_bf16(
